@@ -8,7 +8,7 @@ if [ "$#" -gt 1 ]; then
 fi
 
 target_dir="$(cd "${1:-.}" && pwd)"
-repository="${TWOPANE_REPOSITORY:-git@github-aitopnexus:aitopnexus/2pane-workflow.git}"
+repository="${TWOPANE_REPOSITORY:-https://github.com/aitopnexus/2pane-workflow.git}"
 install_dir="$(mktemp -d "${TMPDIR:-/tmp}/2pane-install.XXXXXX")"
 staged="$target_dir/.2pane.install.$$"
 
@@ -25,8 +25,8 @@ trap cleanup EXIT HUP INT TERM
 
 git clone --quiet --depth 1 "$repository" "$install_dir/source"
 install -m 0755 "$install_dir/source/2pane" "$staged"
+"$staged" init
 mv "$staged" "$target_dir/2pane"
 staged=""
-"$target_dir/2pane" init
 
 printf 'Installed 2pane in %s\n' "$target_dir"
