@@ -27,7 +27,7 @@ if [ "${EXPERT_FULL:-0}" != 1 ]; then
     -c 'personality="none"'
     -c 'tool_output_token_limit=4000'
     -c 'tools.view_image=false'
-    -c 'web_search="disabled"'
+    -c 'web_search="cached"'
   )
 fi
 

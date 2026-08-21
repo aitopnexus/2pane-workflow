@@ -122,7 +122,7 @@ if [ "${EXPERT_FULL:-0}" != 1 ]; then
     -c 'personality="none"'
     -c 'tool_output_token_limit=4000'
     -c 'tools.view_image=false'
-    -c 'web_search="disabled"'
+    -c 'web_search="cached"'
   )
 fi
 exec codex "${CODEX_EXPERT_DEFAULTS[@]}" "$@"
@@ -133,7 +133,7 @@ What it does:
 - Initializes the inbox and archive directory without changing an existing message.
 - Sets `AGENT_ROLE=expert`, the machine-readable source of truth for role detection.
 - Renames the herdr pane to "expert" when running inside herdr, so the two windows are distinguishable.
-- Keeps shell, editing, and project skills while disabling capabilities unrelated to repository consultation.
+- Keeps shell, editing, native cached web search, and project skills while disabling capabilities unrelated to repository consultation.
 - Caps retained tool output at 4,000 tokens so large command results do not inflate later turns.
 - Starts codex without an initial inbox check. Extra arguments pass through, so `./expert --model <id>` still works. Use `EXPERT_FULL=1 ./expert` when a consultation needs the normal plugin and tool set.
 

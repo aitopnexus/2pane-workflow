@@ -65,8 +65,8 @@ assert_contains "launcher disables multi-agent tools" \
   "agents.enabled=false" "$CAPTURE_DIR/argv"
 assert_contains "launcher caps retained tool output" \
   "tool_output_token_limit=4000" "$CAPTURE_DIR/argv"
-assert_contains "launcher disables web search" \
-  'web_search="disabled"' "$CAPTURE_DIR/argv"
+assert_contains "launcher enables cached web search" \
+  'web_search="cached"' "$CAPTURE_DIR/argv"
 
 # Fake herdr: records every call and always succeeds.
 export HERDR_CALLS="$TMP/herdr-calls"
