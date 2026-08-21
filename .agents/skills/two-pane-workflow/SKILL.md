@@ -1,15 +1,15 @@
 ---
 name: two-pane-workflow
-description: Two-pane workflow protocol, a shared inbox file coordinating a main session with an expert session. Use when the human mentions the inbox or .agents/INBOX.md, the other session, the main or expert role, AGENT_ROLE, or the two-pane workflow.
+description: Two-pane workflow protocol. Use when the human mentions the inbox or .agents/INBOX.md, the other session, the main or expert role, AGENT_ROLE, or the two-pane workflow.
 ---
 
 # Two-pane workflow
 
-You are one of two sessions the human runs on this repository, coordinated through a single shared file. The human routes every task and triggers every exchange.
+You are one of two sessions the human runs on this repository, coordinated through a single shared file.
 
 ## Detect your role
 
-Run `echo "${AGENT_ROLE:-main}"`. The value is your role, `expert` or `main`. State it when the human asks.
+Run `echo "${AGENT_ROLE:-main}"`. The value is your role, `expert` or `main`.
 
 ## The inbox
 
