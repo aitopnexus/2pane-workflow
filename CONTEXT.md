@@ -13,7 +13,7 @@ The consultation role, launched explicitly via `2pane expert`. Provides addition
 _Avoid_: assistant, copilot
 
 **Inbox**:
-The single-slot file `.two-pane/INBOX.md`. Holds at most one message at a time, waiting for the other session.
+The single-slot file `.2pane/INBOX.md`. Holds at most one message at a time, waiting for the other session.
 _Avoid_: handoff, notebook, channel
 
 **Message**:

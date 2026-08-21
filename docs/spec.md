@@ -27,7 +27,7 @@ Both roles have full access to the repository. Nothing in the protocol restricts
 All communication flows through one file:
 
 ```
-.two-pane/INBOX.md
+.2pane/INBOX.md
 ```
 
 The inbox is a single slot. It holds at most one message at a time.
@@ -68,7 +68,7 @@ Run:
 ./2pane take
 ```
 
-The helper validates that the sender is the other role, moves the message to `.two-pane/consuming.md`, recreates the empty inbox, and prints the message. A successful take deletes the transient file; a later take resumes it after an interruption. It prints nothing when neither file contains a message.
+The helper validates that the sender is the other role, moves the message to `.2pane/consuming.md`, recreates the empty inbox, and prints the message. A successful take deletes the transient file; a later take resumes it after an interruption. It prints nothing when neither file contains a message.
 
 A reply can go directly through `2pane send`; its built-in slot check replaces another inbox read.
 After sending, the session reports success and yields. A later human request starts the reply read.
@@ -135,7 +135,7 @@ Then run `chmod +x 2pane`. No global configuration, AGENTS.md edits, or external
 Ignore runtime state in the target repository:
 
 ```text
-.two-pane/
+.2pane/
 ```
 
 In repos where `.agents/.gitignore` excludes vendored skills, keep the protocol tracked:

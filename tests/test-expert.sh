@@ -123,7 +123,7 @@ assert_not_contains "full mode omits minimal feature flags" \
 assert_equals "full mode still passes user arguments" \
   "--model test-model" "$(tr '\n' ' ' < "$CAPTURE_DIR/argv" | sed 's/ $//')"
 
-[ -f "$TMP/.two-pane/INBOX.md" ] && [ ! -e "$TMP/.two-pane/archive" ]
+[ -f "$TMP/.2pane/INBOX.md" ] && [ ! -e "$TMP/.2pane/archive" ]
 check_status=$?
 if [ "$check_status" -eq 0 ]; then
   pass=$((pass + 1)); echo "ok - launcher initializes runtime state"

@@ -38,7 +38,7 @@ else
 fi
 
 "$TMP/2pane" init
-if [ -f "$TMP/.two-pane/INBOX.md" ] && [ ! -e "$TMP/.two-pane/archive" ]; then
+if [ -f "$TMP/.2pane/INBOX.md" ] && [ ! -e "$TMP/.2pane/archive" ]; then
   init_status=0
 else
   init_status=1
@@ -53,10 +53,10 @@ check "runtime state stays outside the agent instruction directory" "$protected_
 
 AGENT_ROLE=expert "$TMP/2pane" send $'Build the thing.\nReturn the result.'
 expected=$'from: expert\n\nBuild the thing.\nReturn the result.'
-assert_equals "send publishes the complete message" "$expected" "$(cat "$TMP/.two-pane/INBOX.md")"
+assert_equals "send publishes the complete message" "$expected" "$(cat "$TMP/.2pane/INBOX.md")"
 
 "$TMP/2pane" init
-assert_equals "init preserves an existing message" "$expected" "$(cat "$TMP/.two-pane/INBOX.md")"
+assert_equals "init preserves an existing message" "$expected" "$(cat "$TMP/.2pane/INBOX.md")"
 
 if AGENT_ROLE=expert "$TMP/2pane" send "overwrite" 2>/dev/null; then
   overwrite_status=1
@@ -64,11 +64,11 @@ else
   overwrite_status=0
 fi
 check "send rejects a busy inbox" "$overwrite_status"
-assert_equals "rejected send preserves the message" "$expected" "$(cat "$TMP/.two-pane/INBOX.md")"
+assert_equals "rejected send preserves the message" "$expected" "$(cat "$TMP/.2pane/INBOX.md")"
 
 taken="$(AGENT_ROLE=main "$TMP/2pane" take)"
 assert_equals "take returns the complete message" "$expected" "$taken"
-if [ ! -s "$TMP/.two-pane/INBOX.md" ] && [ ! -e "$TMP/.two-pane/consuming.md" ]; then
+if [ ! -s "$TMP/.2pane/INBOX.md" ] && [ ! -e "$TMP/.2pane/consuming.md" ]; then
   take_status=0
 else
   take_status=1
@@ -76,12 +76,12 @@ fi
 check "take leaves no persistent communication history" "$take_status"
 
 AGENT_ROLE=expert "$TMP/2pane" send "Recover this message."
-mv "$TMP/.two-pane/INBOX.md" "$TMP/.two-pane/consuming.md"
-: > "$TMP/.two-pane/INBOX.md"
+mv "$TMP/.2pane/INBOX.md" "$TMP/.2pane/consuming.md"
+: > "$TMP/.2pane/INBOX.md"
 recovered="$(AGENT_ROLE=main "$TMP/2pane" take)"
 assert_equals "take resumes an interrupted consume" \
   $'from: expert\n\nRecover this message.' "$recovered"
-if [ ! -e "$TMP/.two-pane/consuming.md" ]; then
+if [ ! -e "$TMP/.2pane/consuming.md" ]; then
   recovery_status=0
 else
   recovery_status=1
@@ -89,8 +89,8 @@ fi
 check "successful recovery removes transient state" "$recovery_status"
 
 AGENT_ROLE=expert "$TMP/2pane" send "Still consuming."
-mv "$TMP/.two-pane/INBOX.md" "$TMP/.two-pane/consuming.md"
-: > "$TMP/.two-pane/INBOX.md"
+mv "$TMP/.2pane/INBOX.md" "$TMP/.2pane/consuming.md"
+: > "$TMP/.2pane/INBOX.md"
 if AGENT_ROLE=main "$TMP/2pane" send "too early" >/dev/null 2>&1; then
   consuming_status=1
 else
@@ -109,7 +109,7 @@ else
   own_status=0
 fi
 check "take rejects a message from the same role" "$own_status"
-if [ -s "$TMP/.two-pane/INBOX.md" ]; then
+if [ -s "$TMP/.2pane/INBOX.md" ]; then
   preserve_status=0
 else
   preserve_status=1

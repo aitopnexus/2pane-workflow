@@ -3,7 +3,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="$ROOT/.two-pane"
+STATE_DIR="$ROOT/.2pane"
 INBOX="$STATE_DIR/INBOX.md"
 CONSUMING="$STATE_DIR/consuming.md"
 tmp=""
@@ -52,8 +52,8 @@ init_state() {
   if [ ! -e "$INBOX" ]; then
     : > "$INBOX"
   fi
-  [ -f "$INBOX" ] || fail ".two-pane/INBOX.md must be a regular file"
-  [ ! -e "$CONSUMING" ] || [ -f "$CONSUMING" ] || fail ".two-pane/consuming.md must be a regular file"
+  [ -f "$INBOX" ] || fail ".2pane/INBOX.md must be a regular file"
+  [ ! -e "$CONSUMING" ] || [ -f "$CONSUMING" ] || fail ".2pane/consuming.md must be a regular file"
 }
 
 message_sender() {
