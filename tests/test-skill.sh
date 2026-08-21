@@ -25,6 +25,8 @@ grep -q 'AGENT_ROLE' "$SKILL"; check "body detects the role via AGENT_ROLE" $?
 grep -q '\./two-pane take' "$SKILL"; check "consume delegates to two-pane take" $?
 grep -q '\./two-pane send' "$SKILL"; check "writes delegate to two-pane send" $?
 grep -q 'slot check replaces another read' "$SKILL"; check "reply avoids a redundant inbox read" $?
+grep -q 'Yield after a successful send' "$SKILL"; check "send yields instead of polling" $?
+grep -q 'only the requested result fields' "$SKILL"; check "reply stays scoped to requested fields" $?
 
 echo "---"
 echo "pass=$pass fail=$fail"

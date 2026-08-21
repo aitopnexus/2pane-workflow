@@ -13,13 +13,9 @@ The consultation role, launched explicitly via the `expert` script. Provides add
 _Avoid_: assistant, copilot
 
 **Inbox**:
-The single-slot file `.agents/INBOX.md`. Holds at most one message at a time, waiting for the other session.
+The single-slot file `.two-pane/INBOX.md`. Holds at most one message at a time, waiting for the other session.
 _Avoid_: handoff, notebook, channel
 
 **Message**:
 One unit of communication in the inbox, labeled with its sender by a `from:` line.
 _Avoid_: handoff, note
-
-**Archive**:
-The directory `.agents/archive/` where every consumed message is copied before the inbox is emptied.
-_Avoid_: history, log

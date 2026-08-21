@@ -27,14 +27,15 @@ Both roles have full access to the repository. Nothing in the protocol restricts
 All communication flows through one file:
 
 ```
-.agents/INBOX.md
+.two-pane/INBOX.md
 ```
 
 The inbox is a single slot. It holds at most one message at a time.
+Runtime state stays outside `.agents`, leaving the agent-instruction directory read-only while the helper writes inside the normal workspace boundary.
 
 - Write only into an empty inbox. If you need to write and it is not empty, tell the human. Never overwrite.
 - A message is addressed by sender. If the `from:` line names the other role, the message is yours.
-- Reading consumes. The reader archives the message and empties the file, so the same message is never read twice and the next writer always finds an empty slot.
+- Reading consumes. The reader returns the message and frees the inbox without retaining communication history.
 - One session writes at a time. The human serializes. The protocol has no locking.
 
 ## Message format
@@ -67,9 +68,11 @@ Run:
 ./two-pane take
 ```
 
-The helper validates that the sender is the other role, archives the message, clears the inbox, and prints the consumed message. It prints nothing for an empty inbox. Archive happens before clearing, so a crash mid-consume loses nothing.
+The helper validates that the sender is the other role, moves the message to `.two-pane/consuming.md`, recreates the empty inbox, and prints the message. A successful take deletes the transient file; a later take resumes it after an interruption. It prints nothing when neither file contains a message.
 
 A reply can go directly through `two-pane send`; its built-in slot check replaces another inbox read.
+After sending, the session reports success and yields. A later human request starts the reply read.
+Replies contain only the result fields the request asks for.
 
 ## Components
 
@@ -91,7 +94,7 @@ An executable at the repo root:
 two-pane
 ```
 
-It owns role validation, initialization, busy-slot checks, atomic publication, archive naming, and consume ordering. The model does not reproduce those mechanics.
+It owns role validation, initialization, busy-slot checks, atomic publication, and transient consume recovery. The model does not reproduce those mechanics.
 
 ### 3. The expert script
 
@@ -130,7 +133,7 @@ exec codex "${CODEX_EXPERT_DEFAULTS[@]}" "$@"
 
 What it does:
 
-- Initializes the inbox and archive directory without changing an existing message.
+- Initializes runtime state without changing an existing message.
 - Sets `AGENT_ROLE=expert`, the machine-readable source of truth for role detection.
 - Renames the herdr pane to "expert" when running inside herdr, so the two windows are distinguishable.
 - Keeps shell, editing, native cached web search, and project skills while disabling capabilities unrelated to repository consultation.
@@ -159,16 +162,19 @@ Copy three items into the target repo:
 2. `two-pane`
 3. `expert`
 
-Then run `chmod +x expert two-pane`. No dotfiles changes, AGENTS.md edits, or external dependencies are required.
+Then run `chmod +x expert two-pane`. No global configuration, AGENTS.md edits, or external dependencies are required.
+
+Ignore runtime state in the target repository:
+
+```text
+.two-pane/
+```
 
 In repos where `.agents/.gitignore` excludes vendored skills, keep the protocol tracked:
 
 ```
 skills/*
 !skills/two-pane-workflow/
-INBOX.md
-archive/
-.INBOX.md.tmp.*
 ```
 
 In pi, approve the per-project trust prompt once when first asked. Pi gates `.agents/skills` behind project trust; codex does not.
@@ -179,6 +185,7 @@ In pi, approve the per-project trust prompt once when first asked. Pi gates `.ag
 - The human decides which session handles each task. The human is the only router.
 - The human is the serializer. One session writes at a time.
 - Publish only through `two-pane send`; it rejects a busy inbox.
+- Keep only transient recovery state; successful reads leave no communication history.
 - Main owns normal work. Expert provides additional reasoning.
 - Both roles may do anything. Restrictions are conventions, not rules.
 - No polling, no automatic routing, no orchestration.
