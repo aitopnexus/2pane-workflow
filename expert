@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Launch the expert session of the two-pane workflow.
+# Protocol: .agents/skills/two-pane-workflow/SKILL.md
+export AGENT_ROLE=expert
+herdr pane current &>/dev/null && herdr pane rename expert
+exec codex "You are the Expert session in the two-pane workflow. Protocol: .agents/skills/two-pane-workflow/SKILL.md. Check the inbox." "$@"
