@@ -1,0 +1,3 @@
+# Human is the only router and serializer
+
+Sessions never poll the inbox, never detect messages on their own, and never route work to each other. Every read and every write is triggered by the human, who also ensures only one session touches the inbox at a time. We rejected auto-routing, polling, and file locking because they add orchestration this protocol exists to avoid, and because the human is already in the loop deciding which session handles each task. The one exception is the expert's launch prompt telling it to check the inbox once at startup: the human launching `./expert` is itself the trigger.
