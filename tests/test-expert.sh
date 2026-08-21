@@ -41,15 +41,15 @@ chmod +x "$TMP/bin/codex"
 # `env bash` resolve. herdr lives outside these dirs, so it stays absent.
 FAKE_PATH="$TMP/bin:/bin:/usr/bin"
 
-# Test 1: with no herdr on PATH, the harness still launches with the role
-# announcement prompt and the expert environment.
-PATH="$FAKE_PATH" "$REPO_ROOT/expert"
-assert_contains "harness receives the role announcement prompt" \
-  "Expert session in the two-pane workflow" "$CAPTURE_DIR/argv"
+# Test 1: with no herdr on PATH, the harness launches without an initial
+# prompt and carries the expert role in its environment.
+PATH="$FAKE_PATH" HERDR_ENV= HERDR_PANE_ID= "$REPO_ROOT/expert"
+assert_equals "harness receives no launch-time inbox prompt" \
+  "" "$(cat "$CAPTURE_DIR/argv" 2>/dev/null)"
 assert_equals "harness environment carries AGENT_ROLE=expert" \
   "expert" "$(cat "$CAPTURE_DIR/role" 2>/dev/null)"
 
-# Fake herdr: records every call, succeeds for `pane current`.
+# Fake herdr: records every call and always succeeds.
 export HERDR_CALLS="$TMP/herdr-calls"
 cat > "$TMP/bin/herdr" <<'EOF'
 #!/usr/bin/env bash
@@ -58,19 +58,19 @@ exit 0
 EOF
 chmod +x "$TMP/bin/herdr"
 
-# Test 2: under herdr, the pane is renamed to expert and the harness still
-# launches.
+# Test 2: under herdr (HERDR_ENV=1, pane id injected), the pane is renamed
+# to expert and the harness still launches.
 : > "$HERDR_CALLS"
 rm -f "$CAPTURE_DIR/argv" "$CAPTURE_DIR/role"
-PATH="$FAKE_PATH" "$REPO_ROOT/expert"
+PATH="$FAKE_PATH" HERDR_ENV=1 HERDR_PANE_ID=w1:p1 "$REPO_ROOT/expert"
 assert_contains "pane renamed to expert under herdr" \
-  "pane rename expert" "$HERDR_CALLS"
+  "pane rename w1:p1 expert" "$HERDR_CALLS"
 assert_equals "harness still launches under herdr" \
   "expert" "$(cat "$CAPTURE_DIR/role" 2>/dev/null)"
 
 # Test 3: extra arguments pass through to the harness.
 rm -f "$CAPTURE_DIR/argv" "$CAPTURE_DIR/role"
-PATH="$FAKE_PATH" "$REPO_ROOT/expert" --model test-model
+PATH="$FAKE_PATH" HERDR_ENV= HERDR_PANE_ID= "$REPO_ROOT/expert" --model test-model
 assert_contains "extra arguments pass through to the harness" \
   "--model test-model" "$CAPTURE_DIR/argv"
 

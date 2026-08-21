@@ -84,7 +84,9 @@ An executable at the repo root, run as `./expert`:
 ```bash
 #!/usr/bin/env bash
 export AGENT_ROLE=expert
-herdr pane current &>/dev/null && herdr pane rename expert
+if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+  herdr pane rename "$HERDR_PANE_ID" expert
+fi
 exec codex "You are the EXPERT session in the two-pane workflow. Protocol: .agents/skills/two-pane-workflow/SKILL.md. Check the inbox." "$@"
 ```
 
