@@ -51,21 +51,29 @@ Question or content for the other session...
 
 ### Writing a message
 
-1. Check the inbox is empty.
-2. Write the `from:` line with your role, then the content.
+Run:
+
+```bash
+./two-pane send 'message'
+```
+
+The helper checks the inbox and atomically writes the sender and content. It rejects a non-empty inbox without changing it.
 
 ### Reading and consuming
 
-1. Read `.agents/INBOX.md`.
-2. If the `from:` line names the other role, the message is yours.
-3. Archive it first: copy the message to `.agents/archive/<YYYY-MM-DD-HHMMSS>-from-<role>.md`.
-4. Then empty the inbox.
+Run:
 
-Archive before emptying. A crash mid-consume then loses nothing.
+```bash
+./two-pane take
+```
+
+The helper validates that the sender is the other role, archives the message, clears the inbox, and prints the consumed message. It prints nothing for an empty inbox. Archive happens before clearing, so a crash mid-consume loses nothing.
+
+A reply can go directly through `two-pane send`; its built-in slot check replaces another inbox read.
 
 ## Components
 
-Two items, copied into any repository that adopts the workflow.
+Three items are copied into any repository that adopts the workflow.
 
 ### 1. The protocol skill
 
@@ -73,30 +81,63 @@ Two items, copied into any repository that adopts the workflow.
 .agents/skills/two-pane-workflow
 ```
 
-One skill describing this protocol. Codex and pi both discover `.agents/skills` automatically and list the skill in every session, loading it when the task matches its description. The description must stay scoped to inbox and role words so the skill never triggers during normal work.
+One skill tells the model when to call the state helper and when to act on its output. Codex and pi both discover `.agents/skills` automatically and load it when the task matches its description. The description stays scoped to inbox and workflow-role words.
 
-No edits to AGENTS.md or any other repo file. The skill is the whole protocol.
+### 2. The state helper
 
-### 2. The expert script
+An executable at the repo root:
+
+```text
+two-pane
+```
+
+It owns role validation, initialization, busy-slot checks, atomic publication, archive naming, and consume ordering. The model does not reproduce those mechanics.
+
+### 3. The expert script
 
 An executable at the repo root, run as `./expert`:
 
 ```bash
 #!/usr/bin/env bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$ROOT/two-pane" init
 export AGENT_ROLE=expert
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
   herdr pane rename "$HERDR_PANE_ID" expert
 fi
-exec codex "You are the EXPERT session in the two-pane workflow. Protocol: .agents/skills/two-pane-workflow/SKILL.md. Check the inbox." "$@"
+CODEX_EXPERT_DEFAULTS=()
+if [ "${EXPERT_FULL:-0}" != 1 ]; then
+  CODEX_EXPERT_DEFAULTS=(
+    --disable apps
+    --disable browser_use
+    --disable computer_use
+    --disable goals
+    --disable image_generation
+    --disable in_app_browser
+    --disable multi_agent
+    --disable plugins
+    --disable remote_plugin
+    --disable tool_suggest
+    -c 'agents.enabled=false'
+    -c 'personality="none"'
+    -c 'tool_output_token_limit=4000'
+    -c 'tools.view_image=false'
+    -c 'web_search="disabled"'
+  )
+fi
+exec codex "${CODEX_EXPERT_DEFAULTS[@]}" "$@"
 ```
 
 What it does:
 
+- Initializes the inbox and archive directory without changing an existing message.
 - Sets `AGENT_ROLE=expert`, the machine-readable source of truth for role detection.
 - Renames the herdr pane to "expert" when running inside herdr, so the two windows are distinguishable.
-- Starts codex with an initial prompt that announces the role, points at the protocol skill, and tells the session to check the inbox. Extra arguments pass through, so `./expert --model <id>` still works.
+- Keeps shell, editing, and project skills while disabling capabilities unrelated to repository consultation.
+- Caps retained tool output at 4,000 tokens so large command results do not inflate later turns.
+- Starts codex without an initial inbox check. Extra arguments pass through, so `./expert --model <id>` still works. Use `EXPERT_FULL=1 ./expert` when a consultation needs the normal plugin and tool set.
 
-The launch itself is the human's trigger. No other automatic reading exists in the protocol.
+Launching Expert spends no model turn on an empty inbox. The human explicitly asks a pane to read when a message is waiting.
 
 Swapping which harness plays expert means editing the `exec` line.
 
@@ -112,18 +153,22 @@ Unset means main. Only the expert session needs configuration. The protocol skil
 
 ## Installation
 
-Copy two items into the target repo:
+Copy three items into the target repo:
 
 1. `.agents/skills/two-pane-workflow/`
-2. `expert` (the script), then `chmod +x expert`
+2. `two-pane`
+3. `expert`
 
-Nothing else. No dotfiles changes, no AGENTS.md edits, no dependencies.
+Then run `chmod +x expert two-pane`. No dotfiles changes, AGENTS.md edits, or external dependencies are required.
 
 In repos where `.agents/.gitignore` excludes vendored skills, keep the protocol tracked:
 
 ```
 skills/*
 !skills/two-pane-workflow/
+INBOX.md
+archive/
+.INBOX.md.tmp.*
 ```
 
 In pi, approve the per-project trust prompt once when first asked. Pi gates `.agents/skills` behind project trust; codex does not.
@@ -133,8 +178,8 @@ In pi, approve the per-project trust prompt once when first asked. Pi gates `.ag
 - Keep the protocol simple.
 - The human decides which session handles each task. The human is the only router.
 - The human is the serializer. One session writes at a time.
-- Write only into an empty inbox.
+- Publish only through `two-pane send`; it rejects a busy inbox.
 - Main owns normal work. Expert provides additional reasoning.
 - Both roles may do anything. Restrictions are conventions, not rules.
 - No polling, no automatic routing, no orchestration.
-- The main session needs a harness that discovers skills in `.agents/skills`. The expert additionally needs a harness that accepts an initial prompt.
+- Each session needs a harness that discovers skills in `.agents/skills`.

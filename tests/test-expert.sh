@@ -11,6 +11,10 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/cap"
 export CAPTURE_DIR="$TMP/cap"
+cp "$REPO_ROOT/expert" "$TMP/expert"
+cp "$REPO_ROOT/two-pane" "$TMP/two-pane"
+chmod +x "$TMP/expert" "$TMP/two-pane"
+LAUNCHER="$TMP/expert"
 
 pass=0
 fail=0
@@ -19,6 +23,13 @@ assert_contains() { # label needle file
     pass=$((pass + 1)); echo "ok - $1"
   else
     fail=$((fail + 1)); echo "not ok - $1"
+  fi
+}
+assert_not_contains() { # label needle file
+  if grep -qF -- "$2" "$3"; then
+    fail=$((fail + 1)); echo "not ok - $1"
+  else
+    pass=$((pass + 1)); echo "ok - $1"
   fi
 }
 assert_equals() { # label expected actual
@@ -32,7 +43,7 @@ assert_equals() { # label expected actual
 # Fake harness: records its arguments and AGENT_ROLE, then exits.
 cat > "$TMP/bin/codex" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" > "$CAPTURE_DIR/argv"
+printf '%s\n' "$@" > "$CAPTURE_DIR/argv"
 printf '%s\n' "${AGENT_ROLE:-unset}" > "$CAPTURE_DIR/role"
 EOF
 chmod +x "$TMP/bin/codex"
@@ -43,11 +54,19 @@ FAKE_PATH="$TMP/bin:/bin:/usr/bin"
 
 # Test 1: with no herdr on PATH, the harness launches without an initial
 # prompt and carries the expert role in its environment.
-PATH="$FAKE_PATH" HERDR_ENV= HERDR_PANE_ID= "$REPO_ROOT/expert"
-assert_equals "harness receives no launch-time inbox prompt" \
-  "" "$(cat "$CAPTURE_DIR/argv" 2>/dev/null)"
+PATH="$FAKE_PATH" HERDR_ENV='' HERDR_PANE_ID='' "$LAUNCHER"
+assert_not_contains "harness receives no launch-time inbox prompt" \
+  "Check the inbox" "$CAPTURE_DIR/argv"
 assert_equals "harness environment carries AGENT_ROLE=expert" \
   "expert" "$(cat "$CAPTURE_DIR/role" 2>/dev/null)"
+assert_contains "launcher disables plugin context" \
+  "plugins" "$CAPTURE_DIR/argv"
+assert_contains "launcher disables multi-agent tools" \
+  "agents.enabled=false" "$CAPTURE_DIR/argv"
+assert_contains "launcher caps retained tool output" \
+  "tool_output_token_limit=4000" "$CAPTURE_DIR/argv"
+assert_contains "launcher disables web search" \
+  'web_search="disabled"' "$CAPTURE_DIR/argv"
 
 # Fake herdr: records every call and always succeeds.
 export HERDR_CALLS="$TMP/herdr-calls"
@@ -62,7 +81,7 @@ chmod +x "$TMP/bin/herdr"
 # to expert and the harness still launches.
 : > "$HERDR_CALLS"
 rm -f "$CAPTURE_DIR/argv" "$CAPTURE_DIR/role"
-PATH="$FAKE_PATH" HERDR_ENV=1 HERDR_PANE_ID=w1:p1 "$REPO_ROOT/expert"
+PATH="$FAKE_PATH" HERDR_ENV=1 HERDR_PANE_ID=w1:p1 "$LAUNCHER"
 assert_contains "pane renamed to expert under herdr" \
   "pane rename w1:p1 expert" "$HERDR_CALLS"
 assert_equals "harness still launches under herdr" \
@@ -70,9 +89,29 @@ assert_equals "harness still launches under herdr" \
 
 # Test 3: extra arguments pass through to the harness.
 rm -f "$CAPTURE_DIR/argv" "$CAPTURE_DIR/role"
-PATH="$FAKE_PATH" HERDR_ENV= HERDR_PANE_ID= "$REPO_ROOT/expert" --model test-model
+PATH="$FAKE_PATH" HERDR_ENV='' HERDR_PANE_ID='' "$LAUNCHER" --model test-model
 assert_contains "extra arguments pass through to the harness" \
-  "--model test-model" "$CAPTURE_DIR/argv"
+  "--model" "$CAPTURE_DIR/argv"
+assert_equals "extra arguments follow minimal defaults" \
+  "--model test-model" "$(tail -2 "$CAPTURE_DIR/argv" | tr '\n' ' ' | sed 's/ $//')"
+
+# Test 4: EXPERT_FULL bypasses lean defaults for consultations that need
+# plugins, web search, or other extended capabilities.
+rm -f "$CAPTURE_DIR/argv" "$CAPTURE_DIR/role"
+PATH="$FAKE_PATH" HERDR_ENV='' HERDR_PANE_ID='' EXPERT_FULL=1 \
+  "$LAUNCHER" --model test-model
+assert_not_contains "full mode omits minimal feature flags" \
+  "--disable" "$CAPTURE_DIR/argv"
+assert_equals "full mode still passes user arguments" \
+  "--model test-model" "$(tr '\n' ' ' < "$CAPTURE_DIR/argv" | sed 's/ $//')"
+
+[ -f "$TMP/.agents/INBOX.md" ] && [ -d "$TMP/.agents/archive" ]
+check_status=$?
+if [ "$check_status" -eq 0 ]; then
+  pass=$((pass + 1)); echo "ok - launcher initializes runtime state"
+else
+  fail=$((fail + 1)); echo "not ok - launcher initializes runtime state"
+fi
 
 echo "---"
 echo "pass=$pass fail=$fail"

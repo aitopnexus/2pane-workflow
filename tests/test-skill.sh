@@ -2,7 +2,7 @@
 # Contract checks for the two-pane-workflow skill. Run: tests/test-skill.sh
 #
 # The frontmatter is the interface both harnesses parse; the checks pin the
-# name, the trigger-bearing description, and the role-detection contract.
+# name, trigger, role contract, and delegation to the deterministic helper.
 set -u
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILL="$REPO_ROOT/.agents/skills/two-pane-workflow/SKILL.md"
@@ -22,14 +22,9 @@ head -1 "$SKILL" | grep -q '^---$'; check "frontmatter opens with a YAML delimit
 awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^name: two-pane-workflow$'; check "frontmatter declares the skill name" $?
 awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^description: .*\binbox\b'; check "description carries the inbox trigger branch" $?
 grep -q 'AGENT_ROLE' "$SKILL"; check "body detects the role via AGENT_ROLE" $?
-awk '
-  /^## Consume a message$/ { in_consume=1; next }
-  /^## / && in_consume { in_consume=0 }
-  in_consume && /Archive first:/ { archived=NR }
-  in_consume && /Empty `.agents\/INBOX.md`/ { cleared=NR }
-  in_consume && /Do the work/ { executed=NR }
-  END { exit !(archived && cleared && executed && archived < cleared && cleared < executed) }
-' "$SKILL"; check "consume archives and clears the message before executing it" $?
+grep -q '\./two-pane take' "$SKILL"; check "consume delegates to two-pane take" $?
+grep -q '\./two-pane send' "$SKILL"; check "writes delegate to two-pane send" $?
+grep -q 'slot check replaces another read' "$SKILL"; check "reply avoids a redundant inbox read" $?
 
 echo "---"
 echo "pass=$pass fail=$fail"

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Deterministic state transitions for the two-pane workflow.
+set -eu
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT/.agents"
+INBOX="$STATE_DIR/INBOX.md"
+ARCHIVE_DIR="$STATE_DIR/archive"
+tmp=""
+
+cleanup() {
+  if [ -n "$tmp" ]; then
+    rm -f "$tmp"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+fail() {
+  printf 'two-pane: %s\n' "$1" >&2
+  exit 2
+}
+
+role() {
+  case "${AGENT_ROLE:-main}" in
+    main|expert) printf '%s\n' "${AGENT_ROLE:-main}" ;;
+    *) fail "AGENT_ROLE must be main or expert" ;;
+  esac
+}
+
+init_state() {
+  mkdir -p "$ARCHIVE_DIR"
+  if [ ! -e "$INBOX" ]; then
+    : > "$INBOX"
+  fi
+  [ -f "$INBOX" ] || fail ".agents/INBOX.md must be a regular file"
+}
+
+send_message() {
+  sender="$(role)"
+  init_state
+  [ ! -s "$INBOX" ] || fail "inbox is not empty"
+  [ "$#" -le 1 ] || fail "send accepts one message argument or standard input"
+
+  tmp="$(mktemp "$STATE_DIR/.INBOX.md.tmp.XXXXXX")"
+  {
+    printf 'from: %s\n\n' "$sender"
+    if [ "$#" -eq 1 ]; then
+      printf '%s\n' "$1"
+    else
+      cat
+    fi
+  } > "$tmp"
+  mv "$tmp" "$INBOX"
+  tmp=""
+}
+
+take_message() {
+  recipient="$(role)"
+  init_state
+  [ -s "$INBOX" ] || return 0
+
+  IFS= read -r first_line < "$INBOX" || true
+  case "$first_line" in
+    "from: main") sender=main ;;
+    "from: expert") sender=expert ;;
+    *) fail "inbox has an invalid from line" ;;
+  esac
+  [ "$sender" != "$recipient" ] || fail "inbox message is awaiting the other role"
+
+  timestamp="$(date +%Y-%m-%d-%H%M%S)"
+  archive="$ARCHIVE_DIR/$timestamp-from-$sender.md"
+  suffix=1
+  while [ -e "$archive" ]; do
+    archive="$ARCHIVE_DIR/$timestamp-from-$sender-$suffix.md"
+    suffix=$((suffix + 1))
+  done
+
+  cp "$INBOX" "$archive"
+  : > "$INBOX"
+  cat "$archive"
+}
+
+usage() {
+  printf 'usage: two-pane init | take | send [message]\n' >&2
+  exit 2
+}
+
+case "${1:-}" in
+  init)
+    [ "$#" -eq 1 ] || usage
+    init_state
+    ;;
+  take)
+    [ "$#" -eq 1 ] || usage
+    take_message
+    ;;
+  send)
+    shift
+    send_message "$@"
+    ;;
+  *) usage ;;
+esac

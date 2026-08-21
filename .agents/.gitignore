@@ -1,2 +1,5 @@
 skills/*
 !skills/two-pane-workflow/
+INBOX.md
+archive/
+.INBOX.md.tmp.*

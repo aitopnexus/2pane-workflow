@@ -1,8 +1,34 @@
 #!/usr/bin/env bash
 # Launch the expert session of the two-pane workflow.
 # Protocol: .agents/skills/two-pane-workflow/SKILL.md
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$ROOT/two-pane" init
 export AGENT_ROLE=expert
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
   herdr pane rename "$HERDR_PANE_ID" expert
 fi
-exec codex "$@"
+
+# Keep the consultation pane lean: shell/edit tools and project skills remain,
+# while capabilities unrelated to repository analysis stay out of its context.
+CODEX_EXPERT_DEFAULTS=()
+if [ "${EXPERT_FULL:-0}" != 1 ]; then
+  CODEX_EXPERT_DEFAULTS=(
+    --disable apps
+    --disable browser_use
+    --disable computer_use
+    --disable goals
+    --disable image_generation
+    --disable in_app_browser
+    --disable multi_agent
+    --disable plugins
+    --disable remote_plugin
+    --disable tool_suggest
+    -c 'agents.enabled=false'
+    -c 'personality="none"'
+    -c 'tool_output_token_limit=4000'
+    -c 'tools.view_image=false'
+    -c 'web_search="disabled"'
+  )
+fi
+
+exec codex "${CODEX_EXPERT_DEFAULTS[@]}" "$@"
