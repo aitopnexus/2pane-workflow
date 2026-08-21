@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Behavior tests for the deterministic two-pane state helper.
+# Behavior tests for the deterministic 2pane state helper.
 set -u
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-cp "$REPO_ROOT/two-pane" "$TMP/two-pane"
-chmod +x "$TMP/two-pane"
+cp "$REPO_ROOT/2pane" "$TMP/2pane"
+chmod +x "$TMP/2pane"
 
 pass=0
 fail=0
@@ -25,7 +25,19 @@ assert_equals() { # label expected actual
   fi
 }
 
-"$TMP/two-pane" init
+if help="$("$TMP/2pane" 2>/dev/null)" && printf '%s\n' "$help" | grep -q '^Usage: 2pane'; then
+  check "no arguments show help" 0
+else
+  check "no arguments show help" 1
+fi
+
+if help="$("$TMP/2pane" --help 2>/dev/null)" && printf '%s\n' "$help" | grep -q '^Usage: 2pane'; then
+  check "--help shows help" 0
+else
+  check "--help shows help" 1
+fi
+
+"$TMP/2pane" init
 if [ -f "$TMP/.two-pane/INBOX.md" ] && [ ! -e "$TMP/.two-pane/archive" ]; then
   init_status=0
 else
@@ -39,14 +51,14 @@ else
 fi
 check "runtime state stays outside the agent instruction directory" "$protected_status"
 
-AGENT_ROLE=expert "$TMP/two-pane" send $'Build the thing.\nReturn the result.'
+AGENT_ROLE=expert "$TMP/2pane" send $'Build the thing.\nReturn the result.'
 expected=$'from: expert\n\nBuild the thing.\nReturn the result.'
 assert_equals "send publishes the complete message" "$expected" "$(cat "$TMP/.two-pane/INBOX.md")"
 
-"$TMP/two-pane" init
+"$TMP/2pane" init
 assert_equals "init preserves an existing message" "$expected" "$(cat "$TMP/.two-pane/INBOX.md")"
 
-if AGENT_ROLE=expert "$TMP/two-pane" send "overwrite" 2>/dev/null; then
+if AGENT_ROLE=expert "$TMP/2pane" send "overwrite" 2>/dev/null; then
   overwrite_status=1
 else
   overwrite_status=0
@@ -54,7 +66,7 @@ fi
 check "send rejects a busy inbox" "$overwrite_status"
 assert_equals "rejected send preserves the message" "$expected" "$(cat "$TMP/.two-pane/INBOX.md")"
 
-taken="$(AGENT_ROLE=main "$TMP/two-pane" take)"
+taken="$(AGENT_ROLE=main "$TMP/2pane" take)"
 assert_equals "take returns the complete message" "$expected" "$taken"
 if [ ! -s "$TMP/.two-pane/INBOX.md" ] && [ ! -e "$TMP/.two-pane/consuming.md" ]; then
   take_status=0
@@ -63,10 +75,10 @@ else
 fi
 check "take leaves no persistent communication history" "$take_status"
 
-AGENT_ROLE=expert "$TMP/two-pane" send "Recover this message."
+AGENT_ROLE=expert "$TMP/2pane" send "Recover this message."
 mv "$TMP/.two-pane/INBOX.md" "$TMP/.two-pane/consuming.md"
 : > "$TMP/.two-pane/INBOX.md"
-recovered="$(AGENT_ROLE=main "$TMP/two-pane" take)"
+recovered="$(AGENT_ROLE=main "$TMP/2pane" take)"
 assert_equals "take resumes an interrupted consume" \
   $'from: expert\n\nRecover this message.' "$recovered"
 if [ ! -e "$TMP/.two-pane/consuming.md" ]; then
@@ -76,22 +88,22 @@ else
 fi
 check "successful recovery removes transient state" "$recovery_status"
 
-AGENT_ROLE=expert "$TMP/two-pane" send "Still consuming."
+AGENT_ROLE=expert "$TMP/2pane" send "Still consuming."
 mv "$TMP/.two-pane/INBOX.md" "$TMP/.two-pane/consuming.md"
 : > "$TMP/.two-pane/INBOX.md"
-if AGENT_ROLE=main "$TMP/two-pane" send "too early" >/dev/null 2>&1; then
+if AGENT_ROLE=main "$TMP/2pane" send "too early" >/dev/null 2>&1; then
   consuming_status=1
 else
   consuming_status=0
 fi
 check "send rejects an unfinished consume" "$consuming_status"
-AGENT_ROLE=main "$TMP/two-pane" take >/dev/null
+AGENT_ROLE=main "$TMP/2pane" take >/dev/null
 
-empty="$(AGENT_ROLE=main "$TMP/two-pane" take)"
+empty="$(AGENT_ROLE=main "$TMP/2pane" take)"
 assert_equals "take is quiet for an empty inbox" "" "$empty"
 
-printf 'Reply through standard input.\n' | AGENT_ROLE=main "$TMP/two-pane" send
-if AGENT_ROLE=main "$TMP/two-pane" take >/dev/null 2>&1; then
+printf 'Reply through standard input.\n' | AGENT_ROLE=main "$TMP/2pane" send
+if AGENT_ROLE=main "$TMP/2pane" take >/dev/null 2>&1; then
   own_status=1
 else
   own_status=0
@@ -104,10 +116,10 @@ else
 fi
 check "rejected take preserves the message" "$preserve_status"
 
-reply="$(AGENT_ROLE=expert "$TMP/two-pane" take)"
+reply="$(AGENT_ROLE=expert "$TMP/2pane" take)"
 assert_equals "send accepts standard input" $'from: main\n\nReply through standard input.' "$reply"
 
-if AGENT_ROLE=invalid "$TMP/two-pane" send "bad role" >/dev/null 2>&1; then
+if AGENT_ROLE=invalid "$TMP/2pane" send "bad role" >/dev/null 2>&1; then
   role_status=1
 else
   role_status=0

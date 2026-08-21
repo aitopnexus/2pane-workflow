@@ -18,7 +18,7 @@ The default role. A session with no role configured is main. Main owns normal wo
 
 ### Expert
 
-The consultation role, for analysis, second opinions, and difficult problems. The expert is launched with the `expert` script and is codex by default.
+The consultation role, for analysis, second opinions, and difficult problems. The Expert is launched with `./2pane expert` and is codex by default.
 
 Both roles have full access to the repository. Nothing in the protocol restricts what a session may do. "Main owns normal work" is a convention the human enforces by routing, not a rule the protocol enforces.
 
@@ -55,7 +55,7 @@ Question or content for the other session...
 Run:
 
 ```bash
-./two-pane send 'message'
+./2pane send 'message'
 ```
 
 The helper checks the inbox and atomically writes the sender and content. It rejects a non-empty inbox without changing it.
@@ -65,18 +65,18 @@ The helper checks the inbox and atomically writes the sender and content. It rej
 Run:
 
 ```bash
-./two-pane take
+./2pane take
 ```
 
 The helper validates that the sender is the other role, moves the message to `.two-pane/consuming.md`, recreates the empty inbox, and prints the message. A successful take deletes the transient file; a later take resumes it after an interruption. It prints nothing when neither file contains a message.
 
-A reply can go directly through `two-pane send`; its built-in slot check replaces another inbox read.
+A reply can go directly through `2pane send`; its built-in slot check replaces another inbox read.
 After sending, the session reports success and yields. A later human request starts the reply read.
 Replies contain only the result fields the request asks for.
 
 ## Components
 
-Three items are copied into any repository that adopts the workflow.
+Two items are copied into any repository that adopts the workflow.
 
 ### 1. The protocol skill
 
@@ -86,50 +86,19 @@ Three items are copied into any repository that adopts the workflow.
 
 One skill tells the model when to call the state helper and when to act on its output. Codex and pi both discover `.agents/skills` automatically and load it when the task matches its description. The description stays scoped to inbox and workflow-role words.
 
-### 2. The state helper
+### 2. The `2pane` executable
 
-An executable at the repo root:
+An executable at the repo root, with one command for each workflow operation:
 
 ```text
-two-pane
+2pane
+2pane expert [codex-options...]
+2pane send [message]
+2pane take
+2pane init
 ```
 
-It owns role validation, initialization, busy-slot checks, atomic publication, and transient consume recovery. The model does not reproduce those mechanics.
-
-### 3. The expert script
-
-An executable at the repo root, run as `./expert`:
-
-```bash
-#!/usr/bin/env bash
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"$ROOT/two-pane" init
-export AGENT_ROLE=expert
-if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-  herdr pane rename "$HERDR_PANE_ID" expert
-fi
-CODEX_EXPERT_DEFAULTS=()
-if [ "${EXPERT_FULL:-0}" != 1 ]; then
-  CODEX_EXPERT_DEFAULTS=(
-    --disable apps
-    --disable browser_use
-    --disable computer_use
-    --disable goals
-    --disable image_generation
-    --disable in_app_browser
-    --disable multi_agent
-    --disable plugins
-    --disable remote_plugin
-    --disable tool_suggest
-    -c 'agents.enabled=false'
-    -c 'personality="none"'
-    -c 'tool_output_token_limit=4000'
-    -c 'tools.view_image=false'
-    -c 'web_search="cached"'
-  )
-fi
-exec codex "${CODEX_EXPERT_DEFAULTS[@]}" "$@"
-```
+Running `2pane` without arguments, or with `--help`, prints usage. It owns role validation, initialization, busy-slot checks, atomic publication, transient consume recovery, and Expert launching. The model does not reproduce those mechanics.
 
 What it does:
 
@@ -138,7 +107,7 @@ What it does:
 - Renames the herdr pane to "expert" when running inside herdr, so the two windows are distinguishable.
 - Keeps shell, editing, native cached web search, and project skills while disabling capabilities unrelated to repository consultation.
 - Caps retained tool output at 4,000 tokens so large command results do not inflate later turns.
-- Starts codex without an initial inbox check. Extra arguments pass through, so `./expert --model <id>` still works. Use `EXPERT_FULL=1 ./expert` when a consultation needs the normal plugin and tool set.
+- Starts codex without an initial inbox check. Extra arguments pass through, so `./2pane expert --model <id>` still works. Use `EXPERT_FULL=1 ./2pane expert` when a consultation needs the normal plugin and tool set.
 
 Launching Expert spends no model turn on an empty inbox. The human explicitly asks a pane to read when a message is waiting.
 
@@ -156,13 +125,12 @@ Unset means main. Only the expert session needs configuration. The protocol skil
 
 ## Installation
 
-Copy three items into the target repo:
+Copy two items into the target repo:
 
 1. `.agents/skills/two-pane-workflow/`
-2. `two-pane`
-3. `expert`
+2. `2pane`
 
-Then run `chmod +x expert two-pane`. No global configuration, AGENTS.md edits, or external dependencies are required.
+Then run `chmod +x 2pane`. No global configuration, AGENTS.md edits, or external dependencies are required.
 
 Ignore runtime state in the target repository:
 
@@ -184,7 +152,7 @@ In pi, approve the per-project trust prompt once when first asked. Pi gates `.ag
 - Keep the protocol simple.
 - The human decides which session handles each task. The human is the only router.
 - The human is the serializer. One session writes at a time.
-- Publish only through `two-pane send`; it rejects a busy inbox.
+- Publish only through `2pane send`; it rejects a busy inbox.
 - Keep only transient recovery state; successful reads leave no communication history.
 - Main owns normal work. Expert provides additional reasoning.
 - Both roles may do anything. Restrictions are conventions, not rules.

@@ -9,7 +9,7 @@ The default session role. Owns normal work on the repository.
 _Avoid_: primary, driver
 
 **Expert**:
-The consultation role, launched explicitly via the `expert` script. Provides additional reasoning on request.
+The consultation role, launched explicitly via `2pane expert`. Provides additional reasoning on request.
 _Avoid_: assistant, copilot
 
 **Inbox**:
