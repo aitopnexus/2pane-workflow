@@ -18,6 +18,7 @@ Yield after a successful send; report the send and wait for a new human request 
 1. Run `./two-pane take`. No output means the slot is empty.
 2. Do the work in the printed message.
 3. Send only the requested result fields through `./two-pane send 'reply'`; its slot check replaces another read.
+4. After sending the reply, yield with only a terse acknowledgment.
 
 ## Boundary
 
