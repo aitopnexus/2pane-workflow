@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$ROOT/.2pane"
 INBOX="$STATE_DIR/INBOX.md"
 CONSUMING="$STATE_DIR/consuming.md"
+SKILL_DIR="$ROOT/.agents/skills/two-pane-workflow"
+SKILL="$SKILL_DIR/SKILL.md"
+GITIGNORE="$ROOT/.gitignore"
 tmp=""
 
 cleanup() {
@@ -20,6 +23,7 @@ usage() {
 Usage: 2pane <command> [options]
 
 Commands:
+  init                       Initialize the workflow in this repository
   expert [codex-options...]  Start the Expert session
   send [message]             Send a message to the other role
   take                       Read and consume the waiting message
@@ -38,6 +42,69 @@ usage_error() {
 fail() {
   printf '2pane: %s\n' "$1" >&2
   exit 2
+}
+
+skill_content() {
+  cat <<'EOF'
+---
+name: two-pane-workflow
+description: 2pane inbox routing between Main and Expert. Use for explicit send/receive requests or AGENT_ROLE configuration.
+---
+
+<!-- Managed by ./2pane init. -->
+
+# Two-pane workflow
+
+The human triggers and serializes each inbox action. `AGENT_ROLE=expert` selects Expert; unset selects Main.
+
+After any send, report its result in one line and yield until the human requests the next inbox action.
+
+## Send
+
+Run `./2pane send 'message'`.
+
+## Receive
+
+1. Run `./2pane take`. Empty output means the inbox is empty; report that and yield.
+2. Complete the printed request.
+3. Send only its requested result fields directly with `./2pane send 'reply'`; `send` performs the slot check.
+EOF
+}
+
+init_workflow() {
+  mkdir -p "$SKILL_DIR"
+  [ -d "$SKILL_DIR" ] || fail ".agents/skills/two-pane-workflow must be a directory"
+
+  tmp="$(mktemp "$SKILL_DIR/.SKILL.md.tmp.XXXXXX")"
+  skill_content > "$tmp"
+  if [ -e "$SKILL" ]; then
+    [ -f "$SKILL" ] || fail ".agents/skills/two-pane-workflow/SKILL.md must be a regular file"
+    if cmp -s "$tmp" "$SKILL"; then
+      rm -f "$tmp"
+      tmp=""
+    elif grep -Fqx '<!-- Managed by ./2pane init. -->' "$SKILL"; then
+      mv "$tmp" "$SKILL"
+      tmp=""
+    else
+      fail ".agents/skills/two-pane-workflow/SKILL.md already exists and is not managed by 2pane"
+    fi
+  else
+    mv "$tmp" "$SKILL"
+    tmp=""
+  fi
+
+  if [ -e "$GITIGNORE" ]; then
+    [ -f "$GITIGNORE" ] || fail ".gitignore must be a regular file"
+    if ! grep -Fqx '.2pane/' "$GITIGNORE"; then
+      [ ! -s "$GITIGNORE" ] || printf '\n' >> "$GITIGNORE"
+      printf '.2pane/\n' >> "$GITIGNORE"
+    fi
+  else
+    printf '.2pane/\n' > "$GITIGNORE"
+  fi
+
+  init_state
+  printf 'Initialized two-pane workflow in %s\n' "$ROOT"
 }
 
 role() {
@@ -149,6 +216,10 @@ case "$1" in
   -h|--help)
     [ "$#" -eq 1 ] || usage_error "help accepts no additional arguments"
     usage
+    ;;
+  init)
+    [ "$#" -eq 1 ] || usage_error "init accepts no arguments"
+    init_workflow
     ;;
   expert)
     shift

@@ -31,10 +31,10 @@ else
   check "no arguments show help" 1
 fi
 
-if ! printf '%s\n' "$help" | grep -q '^  init'; then
-  check "init is not a public command" 0
+if printf '%s\n' "$help" | grep -q '^  init'; then
+  check "init is a public command" 0
 else
-  check "init is not a public command" 1
+  check "init is a public command" 1
 fi
 
 if help="$("$TMP/2pane" --help 2>/dev/null)" && printf '%s\n' "$help" | grep -q '^Usage: 2pane'; then
@@ -42,6 +42,37 @@ if help="$("$TMP/2pane" --help 2>/dev/null)" && printf '%s\n' "$help" | grep -q 
 else
   check "--help shows help" 1
 fi
+
+if "$TMP/2pane" init >/dev/null &&
+   [ -f "$TMP/.agents/skills/two-pane-workflow/SKILL.md" ] &&
+   grep -Fqx '<!-- Managed by ./2pane init. -->' "$TMP/.agents/skills/two-pane-workflow/SKILL.md"; then
+  check "init installs the embedded protocol skill" 0
+else
+  check "init installs the embedded protocol skill" 1
+fi
+if grep -Fqx '.2pane/' "$TMP/.gitignore" && [ -f "$TMP/.2pane/INBOX.md" ]; then
+  check "init creates ignored runtime state" 0
+else
+  check "init creates ignored runtime state" 1
+fi
+before_init="$(cat "$TMP/.agents/skills/two-pane-workflow/SKILL.md")"
+"$TMP/2pane" init >/dev/null
+after_init="$(cat "$TMP/.agents/skills/two-pane-workflow/SKILL.md")"
+assert_equals "init is idempotent" "$before_init" "$after_init"
+assert_equals "init adds one runtime ignore rule" "1" "$(grep -Fxc '.2pane/' "$TMP/.gitignore")"
+
+CONFLICT="$TMP/conflict"
+mkdir -p "$CONFLICT/.agents/skills/two-pane-workflow"
+cp "$TMP/2pane" "$CONFLICT/2pane"
+printf 'custom skill\n' > "$CONFLICT/.agents/skills/two-pane-workflow/SKILL.md"
+if "$CONFLICT/2pane" init >/dev/null 2>&1; then
+  conflict_status=1
+else
+  conflict_status=0
+fi
+check "init refuses an unmanaged existing skill" "$conflict_status"
+assert_equals "rejected init preserves an unmanaged skill" "custom skill" \
+  "$(cat "$CONFLICT/.agents/skills/two-pane-workflow/SKILL.md")"
 
 "$TMP/2pane" take >/dev/null
 if [ -f "$TMP/.2pane/INBOX.md" ] && [ ! -e "$TMP/.2pane/archive" ]; then

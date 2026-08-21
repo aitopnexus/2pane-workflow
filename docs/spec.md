@@ -76,28 +76,29 @@ Replies contain only the result fields the request asks for.
 
 ## Components
 
-Two items are copied into any repository that adopts the workflow.
+One executable is copied into any repository that adopts the workflow.
 
-### 1. The protocol skill
+### The protocol skill
 
 ```
 .agents/skills/two-pane-workflow
 ```
 
-One skill tells the model when to call the state helper and when to act on its output. Codex and pi both discover `.agents/skills` automatically and load it when the task matches its description. The description stays scoped to inbox and workflow-role words.
+One skill tells the model when to call the state helper and when to act on its output. It is embedded in `2pane` and materialized by `./2pane init`. Codex and pi both discover `.agents/skills` automatically and load it when the task matches its description. The description stays scoped to inbox and workflow-role words.
 
-### 2. The `2pane` executable
+### The `2pane` executable
 
 An executable at the repo root, with one command for each workflow operation:
 
 ```text
 2pane
+2pane init
 2pane expert [codex-options...]
 2pane send [message]
 2pane take
 ```
 
-Running `2pane` without arguments, or with `--help`, prints usage. It owns role validation, initialization, busy-slot checks, atomic publication, transient consume recovery, and Expert launching. The model does not reproduce those mechanics.
+Running `2pane` without arguments, or with `--help`, prints usage. It owns installation, role validation, initialization, busy-slot checks, atomic publication, transient consume recovery, and Expert launching. The model does not reproduce those mechanics.
 
 What it does:
 
@@ -124,14 +125,19 @@ Unset means main. Only the expert session needs configuration. The protocol skil
 
 ## Installation
 
-Copy two items into the target repo:
+From the target repository, download the executable from the private GitHub repository and initialize it:
 
-1. `.agents/skills/two-pane-workflow/`
-2. `2pane`
+```bash
+gh api repos/aitopnexus/2pane-workflow/contents/2pane \
+  -H 'Accept: application/vnd.github.raw+json' > 2pane.tmp &&
+chmod +x 2pane.tmp &&
+mv 2pane.tmp 2pane &&
+./2pane init
+```
 
-Then run `chmod +x 2pane`. No global configuration, AGENTS.md edits, or external dependencies are required.
+`init` installs the embedded protocol skill, adds `.2pane/` to `.gitignore`, and creates the empty inbox. It is idempotent and refuses to overwrite a skill it does not manage. No global configuration, AGENTS.md edits, or external dependencies are required.
 
-Ignore runtime state in the target repository:
+Runtime state is ignored in the target repository:
 
 ```text
 .2pane/
