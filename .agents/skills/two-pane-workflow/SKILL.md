@@ -31,10 +31,11 @@ A non-empty inbox means an unread message awaits the other session. Tell the hum
 ## Consume a message
 
 1. Read `.agents/INBOX.md`.
-2. When the `from:` line names the other role, the message is yours. Do the work it asks.
+2. When the `from:` line names the other role, the message is yours.
 3. Archive first: copy the message to `.agents/archive/<timestamp>-from-<role>.md`, where `<timestamp>` is the output of `date +%Y-%m-%d-%H%M%S` and `<role>` is the sender on the `from:` line. Create the directory if needed.
 4. Empty `.agents/INBOX.md`.
-5. When the work needs a reply, write your own message with the write procedure.
+5. Do the work described in the archived message.
+6. When the work needs a reply, write your own message with the write procedure.
 
 The consume is complete when the archive file exists, the inbox is empty, and any reply is written.
 

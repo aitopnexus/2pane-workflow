@@ -22,6 +22,14 @@ head -1 "$SKILL" | grep -q '^---$'; check "frontmatter opens with a YAML delimit
 awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^name: two-pane-workflow$'; check "frontmatter declares the skill name" $?
 awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^description: .*\binbox\b'; check "description carries the inbox trigger branch" $?
 grep -q 'AGENT_ROLE' "$SKILL"; check "body detects the role via AGENT_ROLE" $?
+awk '
+  /^## Consume a message$/ { in_consume=1; next }
+  /^## / && in_consume { in_consume=0 }
+  in_consume && /Archive first:/ { archived=NR }
+  in_consume && /Empty `.agents\/INBOX.md`/ { cleared=NR }
+  in_consume && /Do the work/ { executed=NR }
+  END { exit !(archived && cleared && executed && archived < cleared && cleared < executed) }
+' "$SKILL"; check "consume archives and clears the message before executing it" $?
 
 echo "---"
 echo "pass=$pass fail=$fail"
