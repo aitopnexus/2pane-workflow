@@ -17,16 +17,25 @@ check() { # label exit-code
   fi
 }
 
-[ -f "$SKILL" ]; check "skill exists at the spec path .agents/skills/two-pane-workflow" $?
+if [ -f "$SKILL" ]; then
+  check "skill exists at the spec path .agents/skills/two-pane-workflow" 0
+else
+  check "skill exists at the spec path .agents/skills/two-pane-workflow" 1
+fi
 head -1 "$SKILL" | grep -q '^---$'; check "frontmatter opens with a YAML delimiter" $?
 awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^name: two-pane-workflow$'; check "frontmatter declares the skill name" $?
 awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^description: .*\binbox\b'; check "description carries the inbox trigger branch" $?
+awk '/^---$/{c++} c==1' "$SKILL" | grep -q '^description: 2pane '; check "description leads with the command trigger" $?
 grep -q 'AGENT_ROLE' "$SKILL"; check "body detects the role via AGENT_ROLE" $?
+grep -q 'human.*serializes.*inbox action' "$SKILL"; check "human serializes inbox actions" $?
 grep -q '\./2pane take' "$SKILL"; check "consume delegates to 2pane take" $?
 grep -q '\./2pane send' "$SKILL"; check "writes delegate to 2pane send" $?
-grep -q 'slot check replaces another read' "$SKILL"; check "reply avoids a redundant inbox read" $?
-grep -q 'Yield after a successful send' "$SKILL"; check "send yields instead of polling" $?
-grep -q 'only the requested result fields' "$SKILL"; check "reply stays scoped to requested fields" $?
+grep -q 'directly.*\./2pane send' "$SKILL"; check "reply sends directly without another read" $?
+grep -q 'send.*performs the slot check' "$SKILL"; check "send owns the slot check" $?
+grep -q 'yield until the human requests the next inbox action' "$SKILL"; check "send yields to the human router" $?
+grep -q 'only its requested result fields' "$SKILL"; check "reply stays scoped to requested fields" $?
+word_count="$(wc -w < "$SKILL")"
+[ "$word_count" -le 120 ]; check "skill stays within its 120-word context budget" $?
 
 echo "---"
 echo "pass=$pass fail=$fail"
