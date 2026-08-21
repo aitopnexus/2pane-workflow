@@ -31,19 +31,25 @@ else
   check "no arguments show help" 1
 fi
 
+if ! printf '%s\n' "$help" | grep -q '^  init'; then
+  check "init is not a public command" 0
+else
+  check "init is not a public command" 1
+fi
+
 if help="$("$TMP/2pane" --help 2>/dev/null)" && printf '%s\n' "$help" | grep -q '^Usage: 2pane'; then
   check "--help shows help" 0
 else
   check "--help shows help" 1
 fi
 
-"$TMP/2pane" init
+"$TMP/2pane" take >/dev/null
 if [ -f "$TMP/.2pane/INBOX.md" ] && [ ! -e "$TMP/.2pane/archive" ]; then
-  init_status=0
+  state_status=0
 else
-  init_status=1
+  state_status=1
 fi
-check "init creates runtime state" "$init_status"
+check "take initializes runtime state" "$state_status"
 if [ ! -e "$TMP/.agents/INBOX.md" ] && [ ! -e "$TMP/.agents/archive" ]; then
   protected_status=0
 else
@@ -55,15 +61,18 @@ AGENT_ROLE=expert "$TMP/2pane" send $'Build the thing.\nReturn the result.'
 expected=$'from: expert\n\nBuild the thing.\nReturn the result.'
 assert_equals "send publishes the complete message" "$expected" "$(cat "$TMP/.2pane/INBOX.md")"
 
-"$TMP/2pane" init
-assert_equals "init preserves an existing message" "$expected" "$(cat "$TMP/.2pane/INBOX.md")"
-
-if AGENT_ROLE=expert "$TMP/2pane" send "overwrite" 2>/dev/null; then
+busy_error="$TMP/busy-error"
+if AGENT_ROLE=expert "$TMP/2pane" send "overwrite" 2>"$busy_error"; then
   overwrite_status=1
 else
   overwrite_status=0
 fi
 check "send rejects a busy inbox" "$overwrite_status"
+if grep -q '^2pane: inbox is not empty$' "$busy_error" && ! grep -q '^Usage:' "$busy_error"; then
+  check "operational errors omit usage text" 0
+else
+  check "operational errors omit usage text" 1
+fi
 assert_equals "rejected send preserves the message" "$expected" "$(cat "$TMP/.2pane/INBOX.md")"
 
 taken="$(AGENT_ROLE=main "$TMP/2pane" take)"

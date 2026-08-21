@@ -23,7 +23,6 @@ Commands:
   expert [codex-options...]  Start the Expert session
   send [message]             Send a message to the other role
   take                       Read and consume the waiting message
-  init                       Initialize workflow state
 
 Options:
   -h, --help                 Show this help
@@ -37,7 +36,8 @@ usage_error() {
 }
 
 fail() {
-  usage_error "$1"
+  printf '2pane: %s\n' "$1" >&2
+  exit 2
 }
 
 role() {
@@ -130,7 +130,6 @@ launch_expert() {
       -c 'personality="none"'
       -c 'tool_output_token_limit=4000'
       -c 'tools.view_image=false'
-      -c 'web_search="cached"'
     )
   fi
 
@@ -154,10 +153,6 @@ case "$1" in
   expert)
     shift
     launch_expert "$@"
-    ;;
-  init)
-    [ "$#" -eq 1 ] || usage_error "init accepts no arguments"
-    init_state
     ;;
   take)
     [ "$#" -eq 1 ] || usage_error "take accepts no arguments"

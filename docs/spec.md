@@ -95,7 +95,6 @@ An executable at the repo root, with one command for each workflow operation:
 2pane expert [codex-options...]
 2pane send [message]
 2pane take
-2pane init
 ```
 
 Running `2pane` without arguments, or with `--help`, prints usage. It owns role validation, initialization, busy-slot checks, atomic publication, transient consume recovery, and Expert launching. The model does not reproduce those mechanics.
@@ -105,9 +104,9 @@ What it does:
 - Initializes runtime state without changing an existing message.
 - Sets `AGENT_ROLE=expert`, the machine-readable source of truth for role detection.
 - Renames the herdr pane to "expert" when running inside herdr, so the two windows are distinguishable.
-- Keeps shell, editing, native cached web search, and project skills while disabling capabilities unrelated to repository consultation.
+- Keeps shell, editing, and project skills while disabling capabilities unrelated to repository consultation.
 - Caps retained tool output at 4,000 tokens so large command results do not inflate later turns.
-- Starts codex without an initial inbox check. Extra arguments pass through, so `./2pane expert --model <id>` still works. Use `EXPERT_FULL=1 ./2pane expert` when a consultation needs the normal plugin and tool set.
+- Starts codex without an initial inbox check. Extra arguments pass through, so `./2pane expert --model <id>` still works. Use `EXPERT_FULL=1 ./2pane expert --search` when a consultation needs expanded tools or live web search.
 
 Launching Expert spends no model turn on an empty inbox. The human explicitly asks a pane to read when a message is waiting.
 
