@@ -4,17 +4,15 @@ A minimal workflow for running Main and Expert agent sessions in one repository.
 
 ## Install
 
-Authenticate `gh`, then run this from the root of the target repository:
+Run this from the root of the target repository:
 
 ```bash
-gh api repos/aitopnexus/2pane-workflow/contents/2pane \
-  -H 'Accept: application/vnd.github.raw+json' > 2pane.tmp &&
-chmod +x 2pane.tmp &&
-mv 2pane.tmp 2pane &&
-./2pane init
+curl -fsSL https://gist.githubusercontent.com/aitopnexus/d75df86dcc4d7f849cc0e551f6dc47ac/raw/install-2pane.sh | bash
 ```
 
-`init` installs the agent skill, adds `.2pane/` to `.gitignore`, and creates the inbox.
+The installer uses your `github-aitopnexus` SSH credentials to download the private repository. It installs `2pane`, generates the agent skill, adds `.2pane/` to `.gitignore`, and creates the inbox.
+
+[View the installer before running it.](https://gist.github.com/aitopnexus/d75df86dcc4d7f849cc0e551f6dc47ac)
 
 Commit the installed workflow:
 
