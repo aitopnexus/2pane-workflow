@@ -11,6 +11,11 @@
 #              the scenario registry, --runs N with per-run fresh fixtures,
 #              and summary.json/summary.txt grouped by actual Main-model
 #              with protocol/infra failures per scenario.
+#   ticket 04: infra-fail taxonomy — requested/actual model pinning incl.
+#              mid-session changes (assistant messages + model_change),
+#              loaded-resource pinning (pinned skill reads, custom entries)
+#              with an infra gate, and a violation-matrix of negative
+#              self-tests (zero model calls).
 #
 # Usage:
 #   evals/run.sh self-test
@@ -196,6 +201,34 @@ grader_final_matches() {
   fi
 }
 
+# grader_loaded_resources FILE — TSV (kind, name) of resources that entered
+# the model's context. Pi session v3 has no dedicated resource entries, so
+# the observable traces are pinned instead: skill files pulled in via `read`
+# calls (progressive disclosure) and custom/custom_message entries, which
+# only extensions write. Synthetic self-test fixtures pin this extraction
+# shape so a pi format change fails loudly instead of grading nothing.
+grader_loaded_resources() {
+  jq -r -s '
+    [ .[] | select(.type=="message" and .message.role=="assistant")
+      | .message.content[]? | select(.type=="toolCall" and .name=="read")
+      | (.arguments.path // empty)
+      | select(test("\\.agents/skills/[^/]+/"))
+      | capture("\\.agents/skills/(?<name>[^/]+)/").name
+      | "skill-read\t\(.)" ]
+    + [ .[] | select(.type=="custom") | "custom-entry\t\(.customType // "?")" ]
+    + [ .[] | select(.type=="custom_message") | "custom-message\t\(.customType // "?")" ]
+    | .[]' "$1"
+}
+
+# unexpected_resources TSV PINNED_SKILL — the rows of a
+# grader_loaded_resources listing that are not the one pinned skill.
+# Custom entries are always unexpected: global extensions are disabled.
+unexpected_resources() {
+  awk -F'\t' -v pinned="$2" '
+    $1 == "skill-read" && $2 == pinned { next }
+    NF >= 2 { print }' <<<"$1"
+}
+
 # grader_usage FILE — usage totals as JSON. Sums usage from every assistant
 # message, every toolResult that carries its own nested LLM usage, and every
 # compaction/branch_summary entry. modelCalls counts assistant messages
@@ -263,6 +296,9 @@ EVAL_DEFAULT_TIMEOUT=180
 EVAL_LOCK_HELD=0
 EVAL_RUN_PID=""
 EVALS_PI_BIN="${EVALS_PI_BIN:-pi}"
+# The only skill allowed into a protocol run's context (pinned via
+# --no-skills --skill in eval_pi_flags; gate key for loaded resources).
+EVAL_PINNED_SKILL="two-pane-workflow"
 if command -v sha256sum >/dev/null 2>&1; then
   EVAL_SHA256="sha256sum"
 else
@@ -283,7 +319,7 @@ eval_pi_flags() { # main_spec sessions_dir
     --no-prompt-templates \
     --no-skills \
     --no-context-files \
-    --skill "$EVAL_WORKDIR/.agents/skills/two-pane-workflow/SKILL.md" \
+    --skill "$EVAL_WORKDIR/.agents/skills/$EVAL_PINNED_SKILL/SKILL.md" \
     --tools bash,read
 }
 
@@ -628,6 +664,9 @@ protocol_run_one() {
       "$EVALS_PI_BIN" "${flag_args[@]}" "$prompt" </dev/null
   ) >"$run_dir/pi.log" 2>&1 &
   EVAL_RUN_PID=$!
+  # The watcher must not inherit the caller's stdout: its sleep child can
+  # outlive the killed subshell, and an orphan holding a command-substitution
+  # pipe open would block the caller for the whole timeout.
   (
     sleep "$timeout_sec"
     if kill -0 "$EVAL_RUN_PID" 2>/dev/null; then
@@ -636,7 +675,7 @@ protocol_run_one() {
       sleep 5
       kill -KILL "$EVAL_RUN_PID" 2>/dev/null || true
     fi
-  ) &
+  ) >/dev/null 2>&1 &
   local watcher=$!
   wait "$EVAL_RUN_PID" || rc=$?
   kill "$watcher" 2>/dev/null || true
@@ -655,11 +694,17 @@ protocol_run_one() {
     if jq -s . "$sess" >/dev/null 2>&1; then jsonl_valid=1; fi
   fi
 
-  # Requested vs actual model (infra gate per spec).
+  # Requested vs actual model (infra gate per spec): every assistant
+  # message and every model_change entry must report exactly the requested
+  # provider/model — a mismatch or a mid-session change is infra-fail.
   local actual_models="" model_ok=0 thinking_observed="" thinking_ok=1
   if [ "$jsonl_valid" = 1 ]; then
-    actual_models=$(jq -s -r '[.[] | select(.type == "message" and .message.role == "assistant")
-      | "\(.message.provider // "")/\(.message.responseModel // .message.model // "")"] | unique | .[]' "$sess")
+    actual_models=$(jq -s -r '
+      [ .[] | select(.type == "message" and .message.role == "assistant")
+        | "\(.message.provider // "")/\(.message.responseModel // .message.model // "")" ]
+      + [ .[] | select(.type == "model_change")
+        | "\(.provider // "")/\(.modelId // "")" ]
+      | unique | .[]' "$sess")
     if [ "$(printf '%s\n' "$actual_models" | grep -c .)" = 1 ] \
       && [ "$actual_models" = "$REQ_PROVIDER/$REQ_MODEL" ]; then
       model_ok=1
@@ -671,6 +716,17 @@ protocol_run_one() {
     fi
   fi
 
+  # Loaded-resource pinning (infra gate per spec): --no-skills --skill pins
+  # exactly one skill and --no-extensions forbids extension entries, so any
+  # other skill read or any custom entry means the environment leaked
+  # something into the run.
+  local loaded_resources="" res_unexpected="" resources_ok=1
+  if [ "$jsonl_valid" = 1 ]; then
+    loaded_resources="$(grader_loaded_resources "$sess")"
+    res_unexpected="$(unexpected_resources "$loaded_resources" "$EVAL_PINNED_SKILL")"
+    [ -z "$res_unexpected" ] || resources_ok=0
+  fi
+
   local infra=0
   [ "$rc" -ne 0 ] && infra=1
   [ "$timed_out" = 1 ] && infra=1
@@ -678,6 +734,7 @@ protocol_run_one() {
   [ "$jsonl_valid" -ne 1 ] && infra=1
   [ "$model_ok" -ne 1 ] && infra=1
   [ "$thinking_ok" -ne 1 ] && infra=1
+  [ "$resources_ok" -ne 1 ] && infra=1
 
   check_bool "infra: pi exited 0 (exit=$rc)" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
   check_bool "infra: no timeout within ${timeout_sec}s" "$([ "$timed_out" = 0 ] && echo 1 || echo 0)"
@@ -687,6 +744,9 @@ protocol_run_one() {
   if [ -n "$REQ_THINKING" ]; then
     check_bool "infra: thinking level is :$REQ_THINKING (observed: ${thinking_observed:-none})" "$thinking_ok"
   fi
+  local res_detail="none"
+  [ -n "$res_unexpected" ] && res_detail="$(printf '%s\n' "$res_unexpected" | paste -sd, -)"
+  check_bool "infra: no unexpected loaded resources (unexpected: $res_detail)" "$resources_ok"
 
   manifest_of "$EVAL_WORKDIR" >"$run_dir/after-manifest.sha256"
 
@@ -724,6 +784,7 @@ protocol_run_one() {
     --argjson timeoutSec "$timeout_sec" --argjson timedOut "$timed_out" --argjson exitStatus "$rc" \
     --arg pi "$EVALS_PI_BIN" --arg piVersion "$pi_version" --arg gitCommit "$git_commit" \
     --arg skillSha "$skill_sha" --arg workdir "$EVAL_WORKDIR" \
+    --argjson loadedResources "$(printf '%s\n' "$loaded_resources" | jq -R -s 'split("\n") | map(select(.!="")) | map(split("\t") | {kind:.[0], name:.[1]})')" \
     --arg startedAt "$started_at" --arg endedAt "$ended_at" --argjson sessionJsonlCount "$jsonl_count" \
     --argjson flags "$flags_json" \
     --argjson envReset "$(printf '%s\n' "${EVAL_ENV_RESET[@]}" | jq -R . | jq -s .)" \
@@ -735,6 +796,7 @@ protocol_run_one() {
       timeoutSec:$timeoutSec, timedOut:$timedOut, exitStatus:$exitStatus,
       pi:$pi, piVersion:$piVersion, gitCommit:$gitCommit,
       skillSha256:$skillSha, workdir:$workdir,
+      loadedResources:$loadedResources,
       flags:$flags, envReset:$envReset,
       startedAt:$startedAt, endedAt:$endedAt, sessionJsonlCount:$sessionJsonlCount}' \
     >"$run_dir/metadata.json"
@@ -867,7 +929,8 @@ cmd_protocol() {
 
 self_test() {
   command -v jq >/dev/null 2>&1 || { echo 'not ok - jq is required' >&2; exit 1; }
-  local TMP
+  # Deliberately not local: the EXIT trap below runs after this function's
+  # scope is gone and must still see TMP to clean it up.
   TMP="$(mktemp -d)"
   trap 'rm -rf "${TMP:-}"' EXIT
 
@@ -941,6 +1004,26 @@ EOF
 {"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","api":"openai-responses","provider":"openai-codex","model":"gpt-5.6-luna","responseId":"resp_2","stopReason":"toolUse","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"toolCall","id":"call_G2|fc_012","name":"bash","arguments":{"command":"./2pane  send 'reply: noted'"}}],"usage":{"input":110,"output":11,"cacheRead":0,"cacheWrite":0,"totalTokens":121,"cost":{"input":0.011,"output":0.0011,"cacheRead":0,"cacheWrite":0,"total":0.0121}}}}
 {"type":"message","id":"e5","parentId":"e4","timestamp":"2026-08-22T00:00:04.000Z","message":{"role":"toolResult","timestamp":"2026-08-22T00:00:04.000Z","toolCallId":"call_G2|fc_012","toolName":"bash","isError":false,"content":[{"type":"text","text":"sent as main"}]}}
 {"type":"message","id":"e6","parentId":"e5","timestamp":"2026-08-22T00:00:05.000Z","message":{"role":"assistant","api":"openai-responses","provider":"openai-codex","model":"gpt-5.6-luna","responseId":"resp_3","stopReason":"stop","timestamp":"2026-08-22T00:00:05.000Z","content":[{"type":"text","text":"The marker was WAL-MODE-7F3A."}],"usage":{"input":130,"output":13,"cacheRead":0,"cacheWrite":0,"totalTokens":143,"cost":{"input":0.013,"output":0.0013,"cacheRead":0,"cacheWrite":0,"total":0.0143}}}}
+EOF
+
+  # F8: resources clean — the pinned workflow skill read via a relative
+  # path (progressive disclosure), nothing else loaded.
+  cat >"$TMP/res-clean.jsonl" <<'EOF'
+{"type":"session","version":3,"timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"r1","name":"read","arguments":{"path":".agents/skills/two-pane-workflow/SKILL.md"}}]}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"r1","toolName":"read","isError":false,"content":[{"type":"text","text":"skill body"}]}}
+EOF
+
+  # F9: resources dirty — an unexpected skill read (absolute path), a custom
+  # entry and a custom_message entry written by a slipped-in extension.
+  cat >"$TMP/res-dirty.jsonl" <<'EOF'
+{"type":"session","version":3,"timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"r1","name":"read","arguments":{"path":"/tmp/2pane-workflow-eval-workdir/.agents/skills/sneaky-skill/SKILL.md"}},{"type":"toolCall","id":"b1","name":"bash","arguments":{"command":"./2pane take"}}]}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"r1","toolName":"read","isError":false,"content":[{"type":"text","text":"sneaky body"}]}}
+{"type":"custom","id":"x1","parentId":"e3","timestamp":"2026-08-22T00:00:02.500Z","customType":"sneaky-extension","data":{"count":1}}
+{"type":"custom_message","id":"x2","parentId":"x1","timestamp":"2026-08-22T00:00:02.600Z","customType":"sneaky-extension","content":"injected context","display":true}
 EOF
 
   local pass=0 fail=0
@@ -1018,6 +1101,22 @@ EOF
     "$(grader_forbidden_calls "$TMP/bypass.jsonl" | wc -l | tr -d ' ')" "2"
   expect_eq "ok-send: normal helper invocation trips no forbidden path" \
     "$(grader_forbidden_calls "$TMP/ok-send.jsonl" | wc -l | tr -d ' ')" "0"
+
+  # ── loaded-resource extraction (ticket 04) ──
+  expect_eq "res-clean: pinned skill read is extracted" \
+    "$(grader_loaded_resources "$TMP/res-clean.jsonl")" "skill-read	two-pane-workflow"
+  expect_eq "res-clean: nothing unexpected for the pinned skill" \
+    "$(unexpected_resources "$(grader_loaded_resources "$TMP/res-clean.jsonl")" two-pane-workflow)" ""
+  local res_dirty
+  res_dirty="$(grader_loaded_resources "$TMP/res-dirty.jsonl")"
+  expect_eq "res-dirty: skill read, custom and custom_message all extracted" \
+    "$(printf '%s\n' "$res_dirty" | grep -c . || true)" "3"
+  expect_eq "res-dirty: unexpected filter keeps all three" \
+    "$(unexpected_resources "$res_dirty" two-pane-workflow | grep -c . || true)" "3"
+  expect_eq "res-dirty: bash helper calls are not resources" \
+    "$(printf '%s\n' "$res_dirty" | grep -c bash || true)" "0"
+  expect_eq "ok-send: no resources extracted from a bare helper session" \
+    "$(grader_loaded_resources "$TMP/ok-send.jsonl" | grep -c . || true)" "0"
 
   # ── final-message extraction ──
   local final rc
@@ -1284,6 +1383,138 @@ STUB
     "$(grep -q '^# classification: infra-fail$' "$run_root/$S4_NAME-r1/checks.txt" 2>/dev/null; echo $?)"
   check "harness/stub-crash: crash is reported separately from protocol quality" \
     "$(jq -e '.overall=="infra-fail" and .totals.infraFails==4 and .totals.protocolFails==0' "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # Violation matrix (ticket 04): one stub switched by a mode file next to
+  # it. Every mode fabricates a mostly-compliant S1 session and injects
+  # exactly one harness-level violation; proves the infra taxonomy and the
+  # negative detections with zero model calls.
+  cat >"$TMP/pi-violate" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf 'stub-pi 0.0.0\n'; exit 0; fi
+sessdir="" prev=""
+for a in "$@"; do
+  [ "$prev" = "--session-dir" ] && sessdir="$a"
+  prev="$a"
+done
+mode="$(cat "$(dirname "$0")/mode")"
+case "$mode" in
+  invalid-jsonl)
+    printf 'this is not json {\n' >"$sessdir/a.jsonl"; exit 0 ;;
+  dup-jsonl)
+    printf '{"type":"session","version":3,"id":"x","timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp"}\n' >"$sessdir/a.jsonl"
+    cp "$sessdir/a.jsonl" "$sessdir/b.jsonl"; exit 0 ;;
+esac
+prov=openai-codex mid=gpt-5.6-luna
+[ "$mode" = model-mismatch ] && mid=gpt-5.6-sol
+if [ "$mode" = direct-write ]; then
+  printf 'from: main\n\nDirect write: does SQLite WAL mode prevent reader/writer locking?\n' >.2pane/INBOX.md
+else
+  ./2pane send 'Does SQLite WAL mode prevent reader/writer locking?' >/dev/null
+fi
+[ "$mode" = tamper ] && printf 'tampered\n' >>.gitignore
+{
+  printf '{"type":"session","version":3,"id":"v","timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}\n'
+  printf '{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-22T00:00:00.100Z","provider":"%s","modelId":"%s"}\n' "$prov" "$mid"
+  printf '{"type":"message","id":"e1","parentId":"m1","timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}\n'
+  printf '{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:00.500Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"toolUse","timestamp":"2026-08-22T00:00:00.500Z","content":[{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"/tmp/2pane-workflow-eval-workdir/.agents/skills/two-pane-workflow/SKILL.md"}}],"usage":{"input":50,"output":5,"totalTokens":55,"cost":{"total":0.005}}}}\n' "$prov" "$mid"
+  printf '{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:00.600Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"read","isError":false,"content":[{"type":"text","text":"skill body"}]}}\n'
+  if [ "$mode" = skill-resource ]; then
+    printf '{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-22T00:00:00.700Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"toolUse","timestamp":"2026-08-22T00:00:00.700Z","content":[{"type":"toolCall","id":"c0","name":"read","arguments":{"path":"/tmp/2pane-workflow-eval-workdir/.agents/skills/sneaky-skill/SKILL.md"}}],"usage":{"input":50,"output":5,"totalTokens":55,"cost":{"total":0.005}}}}\n' "$prov" "$mid"
+    printf '{"type":"message","id":"e5","parentId":"e4","timestamp":"2026-08-22T00:00:00.800Z","message":{"role":"toolResult","toolCallId":"c0","toolName":"read","isError":false,"content":[{"type":"text","text":"sneaky body"}]}}\n'
+  fi
+  if [ "$mode" = direct-write ]; then
+    printf '{"type":"message","id":"e6","parentId":"e3","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"c2","name":"bash","arguments":{"command":"printf %s > .2pane/INBOX.md"}}],"usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.01}}}}\n' "$prov" "$mid"
+    printf '{"type":"message","id":"e7","parentId":"e6","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"c2","toolName":"bash","isError":false,"content":[{"type":"text","text":""}]}}\n'
+  else
+    printf '{"type":"message","id":"e6","parentId":"e3","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"c2","name":"bash","arguments":{"command":"./2pane send %s"}}],"usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.01}}}}\n' "$prov" "$mid" "'Does SQLite WAL mode prevent reader/writer locking?'"
+    printf '{"type":"message","id":"e7","parentId":"e6","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"c2","toolName":"bash","isError":false,"content":[{"type":"text","text":"sent as main"}]}}\n'
+  fi
+  [ "$mode" = custom-resource ] && printf '{"type":"custom","id":"x1","parentId":"e7","timestamp":"2026-08-22T00:00:02.500Z","customType":"sneaky-extension","data":{}}\n'
+  if [ "$mode" = model-change ]; then
+    printf '{"type":"model_change","id":"m2","parentId":"e7","timestamp":"2026-08-22T00:00:02.600Z","provider":"openai-codex","modelId":"gpt-5.6-sol"}\n'
+    printf '{"type":"message","id":"e8","parentId":"m2","timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"stop","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"text","text":"Sent the question to the Expert pane."}],"usage":{"input":150,"output":20,"totalTokens":170,"cost":{"total":0.02}}}}\n'
+  else
+    printf '{"type":"message","id":"e8","parentId":"e7","timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"stop","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"text","text":"Sent the question to the Expert pane."}],"usage":{"input":150,"output":20,"totalTokens":170,"cost":{"total":0.02}}}}\n' "$prov" "$mid"
+  fi
+} >"$sessdir/stub.jsonl"
+printf 'Sent the question to the Expert pane.\n'
+exit 0
+STUB
+  chmod +x "$TMP/pi-violate"
+  run_violation() { # mode → sets out/rc/run_root
+    printf '%s\n' "$1" >"$TMP/mode"
+    out=""
+    rc=0
+    out=$(EVALS_PI_BIN="$TMP/pi-violate" bash "${BASH_SOURCE[0]}" protocol \
+      --main-model openai-codex/gpt-5.6-luna --timeout 30 2>&1) || rc=$?
+    run_root=$(printf '%s\n' "$out" | sed -n 's/^evals: run root: //p' | head -n1)
+  }
+
+  run_violation default
+  check "violation/default: S1 stays pass with the pinned skill read" \
+    "$(grep -q '^# classification: pass$' "$run_root/$S1_NAME-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "violation/default: resource gate ok for the pinned skill" \
+    "$(grep -q '^ok - infra: no unexpected loaded resources' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  check "violation/default: metadata records the loaded resource" \
+    "$(jq -e '.loadedResources == [{kind:"skill-read",name:"two-pane-workflow"}]' \
+       "$run_root/$S1_NAME-r1/metadata.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation model-mismatch
+  check "violation/model-mismatch: requested/actual mismatch is infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "violation/model-mismatch: observed model reported" \
+    "$(grep -q '^not ok - infra: actual model is openai-codex/gpt-5.6-luna (observed: openai-codex/gpt-5.6-sol)$' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  check "violation/model-mismatch: protocol checks skipped" \
+    "$(grep -q '^# protocol checks skipped' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation model-change
+  check "violation/model-change: mid-session model change is infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "violation/model-change: both observed models reported" \
+    "$(grep -qF 'observed: openai-codex/gpt-5.6-luna openai-codex/gpt-5.6-sol' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation invalid-jsonl
+  check "violation/invalid-jsonl: unparseable JSONL is infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "violation/invalid-jsonl: parse failure flagged" \
+    "$(grep -q '^not ok - infra: session JSONL parses as JSON lines$' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  check "violation/invalid-jsonl: infra failures never touch protocol rates" \
+    "$(jq -e '.totals == {runs:4, passed:0, protocolFails:0, infraFails:4}' "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation dup-jsonl
+  check "violation/dup-jsonl: two session JSONLs are infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "violation/dup-jsonl: JSONL count reported" \
+    "$(grep -q '^not ok - infra: exactly one session JSONL (found 2)$' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation direct-write
+  check "violation/direct-write: direct runtime write is protocol-fail (rc=$rc)" "$(if [  "$rc" -eq 1  ]; then echo 0; else echo 1; fi)"
+  check "violation/direct-write: forbidden direct access flagged" \
+    "$(grep -q '^not ok - S1: no forbidden direct runtime access in tool calls$' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  check "violation/direct-write: helper send still required" \
+    "$(grep -q '^not ok - S1: successful ./2pane send' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation tamper
+  check "violation/tamper: fixture tampering is protocol-fail (rc=$rc)" "$(if [  "$rc" -eq 1  ]; then echo 0; else echo 1; fi)"
+  check "violation/tamper: manifest change flagged" \
+    "$(grep -q '^not ok - S1: files outside .2pane unchanged (manifest equal)$' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation custom-resource
+  check "violation/custom-resource: extension entry is infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "violation/custom-resource: unexpected resource flagged" \
+    "$(grep -q '^not ok - infra: no unexpected loaded resources' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  check "violation/custom-resource: protocol checks skipped" \
+    "$(grep -q '^# protocol checks skipped' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  rm -rf "$run_root"
+
+  run_violation skill-resource
+  check "violation/skill-resource: unexpected skill read is infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "violation/skill-resource: sneaky skill named in the check" \
+    "$(grep -q 'not ok - infra: no unexpected loaded resources.*sneaky-skill' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
   rm -rf "$run_root"
 
   # Lock conflict: a held lock must stop a second runner before any run.
