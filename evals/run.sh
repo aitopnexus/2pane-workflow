@@ -35,7 +35,14 @@
 #              fingerprint, session hash, usage snapshot), exploratory marker
 #              on single-sample comparisons, and the full token+money cost
 #              report (Main vs Expert vs baseline, Expert share).
-#   fix 2026-08-22: grader_reads_outside_fixture also accepts the PHYSICAL
+#   fix 2026-08-22 #2: helper-call recognition accepts an inert `cd DIR &&`
+#              prefix before the standalone `./2pane send|take` (observed
+#              live: models spelling the call `cd <workdir> && ./2pane send`;
+#              cd cannot read/write/pipe anything). The helper must be the
+#              LAST segment; any other chaining, pipes, redirects or
+#              non-send/take subcommands still fail, and the forbidden-path
+#              args scan (which catches `cd …/.2pane && …`) is unchanged.
+#   fix 2026-08-22 #1: grader_reads_outside_fixture also accepts the PHYSICAL
 #              (symlink-resolved) spelling of the eval workdir — on macOS
 #              /tmp → /private/tmp, and a model reading the fixture docs via
 #              the canonical path was falsely flagged as reading outside
@@ -186,15 +193,68 @@ command_is_standalone() {
   return 0
 }
 
+# split_unquoted_amp COMMAND — print COMMAND's segments split on unquoted
+# `&&`, quote-aware: a quoted && is data, not a chain.
+split_unquoted_amp() {
+  local cmd="$1" i ch quote="" seg=""
+  for ((i = 0; i < ${#cmd}; i++)); do
+    ch="${cmd:i:1}"
+    if [ -n "$quote" ]; then
+      seg+="$ch"
+      [ "$ch" = "$quote" ] && quote=""
+      continue
+    fi
+    case "$ch" in
+      "'"|'"') quote="$ch"; seg+="$ch" ;;
+      "&")
+        if [ "${cmd:i+1:1}" = "&" ]; then
+          printf '%s\n' "$seg"
+          seg=""
+          i=$((i + 1))
+        else
+          seg+="$ch"
+        fi ;;
+      *) seg+="$ch" ;;
+    esac
+  done
+  printf '%s\n' "$seg"
+}
+
+# helper_shape_sub COMMAND — prints `send`/`take` and exits 0 iff COMMAND is
+# a helper invocation in the narrow allowed shape: the LAST `&&`-segment is
+# a standalone `./2pane send|take ...` (as before), optionally preceded only
+# by inert `cd DIR` segments (first token `cd`, no chaining/redirection —
+# cd cannot read, write or pipe anything, so a model spelling the call
+# `cd <workdir> && ./2pane send ...` is graded on the helper it ran).
+# Everything else — other commands before or after the helper, pipes,
+# redirections, non-send/take subcommands — still fails, and the
+# forbidden-path scan over serialized arguments applies independently
+# (`cd …/.2pane && …` stays a violation).
+helper_shape_sub() {
+  local cmd="$1" seg sub i
+  local -a segs=() toks
+  while IFS= read -r seg; do segs+=("$seg"); done < <(split_unquoted_amp "$cmd")
+  local n=${#segs[@]}
+  [ "$n" -ge 1 ] || return 1
+  sub="$(helper_subcommand "${segs[n-1]}")" || return 1
+  command_is_standalone "${segs[n-1]}" || return 1
+  for ((i = 0; i < n - 1; i++)); do
+    read -r -a toks <<<"${segs[i]}"
+    [ "${toks[0]-}" = cd ] || return 1
+    command_is_standalone "${segs[i]}" || return 1
+  done
+  printf '%s\n' "$sub"
+}
+
 # grader_helper_calls FILE [send|take] — TSV of bash tool events that are a
-# standalone `./2pane <subcommand>` invocation (fields as in grader_tool_events).
+# helper invocation in the allowed shape (standalone `./2pane <subcommand>`,
+# optionally cd-prefixed; fields as in grader_tool_events).
 grader_helper_calls() {
   local want="${2-}" sub
   grader_tool_events "$1" | while IFS=$'\t' read -r seq id name command status text; do
     [ "$name" = "bash" ] || continue
-    sub="$(helper_subcommand "$command")" || continue
+    sub="$(helper_shape_sub "$command")" || continue
     { [ -z "$want" ] || [ "$sub" = "$want" ]; } || continue
-    command_is_standalone "$command" || continue
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$seq" "$id" "$sub" "$command" "$status" "$text"
   done
 }
@@ -799,7 +859,7 @@ protocol_checks_common() {
   nb=$(grader_bash_calls "$sess" | grep -c . || true)
   nh=$(grader_helper_calls "$sess" | grep -c . || true)
   v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
-  check_bool "$tag: every bash call is a standalone ./2pane helper invocation ($nb bash, $nh helper)" "$v"
+  check_bool "$tag: every bash call is a ./2pane helper invocation, standalone or cd-prefixed ($nb bash, $nh helper)" "$v"
 
   v=0; cmp -s "$run_dir/before-manifest.sha256" "$run_dir/after-manifest.sha256" && v=1
   check_bool "$tag: files outside .2pane unchanged (manifest equal)" "$v"
@@ -1506,11 +1566,6 @@ econ_role_checks() {
   v=0; [ -z "$(grader_forbidden_calls "$sess")" ] && v=1
   check_bool "$tag: no forbidden direct runtime access in tool calls" "$v"
 
-  nb=$(grader_bash_calls "$sess" | grep -c . || true)
-  nh=$(grader_helper_calls "$sess" | grep -c . || true)
-  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
-  check_bool "$tag: every bash call is a standalone ./2pane helper invocation ($nb bash, $nh helper)" "$v"
-
   v=0; [ -z "$(grader_reads_outside_fixture "$sess")" ] && v=1
   check_bool "$tag: read tool used only for fixture files" "$v"
 
@@ -1520,6 +1575,11 @@ econ_role_checks() {
   { [ "$(printf '%s\n' "$models" | grep -c .)" = 1 ] \
     && [ "$models" = "$REQ_PROVIDER/$REQ_MODEL" ]; } && v=1
   check_bool "$tag: every continued turn ran $REQ_PROVIDER/$REQ_MODEL (observed: $(printf '%s' "$models" | tr '\n' ' '))" "$v"
+
+  nb=$(grader_bash_calls "$sess" | grep -c . || true)
+  nh=$(grader_helper_calls "$sess" | grep -c . || true)
+  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
+  check_bool "$tag: every bash call is a ./2pane helper invocation, standalone or cd-prefixed ($nb bash, $nh helper)" "$v"
 }
 
 # econ_checks_run RUN_DIR MAIN_SPEC EXPERT_SPEC — E1 assertions on the
@@ -2150,6 +2210,41 @@ EOF
     "$(grader_helper_calls "$TMP/bypass.jsonl" | grep -c 'call_E3' || true)" "0"
   expect_eq "bypass: semicolon-chained send is not a helper call" \
     "$(grader_helper_calls "$TMP/bypass.jsonl" | grep -c 'call_E5' || true)" "0"
+
+  # F5b: cd-prefixed helper calls — an inert `cd DIR &&` prefix is graded on
+  # the helper it runs (observed live: models spelling the call
+  # `cd <workdir> && ./2pane send ...`); everything else stays strict: the
+  # helper must be the LAST segment, pipes/other commands still reject, and
+  # a quoted && inside helper args is data, not a chain.
+  cat >"$TMP/cd-prefix.jsonl" <<'EOF'
+{"type":"session","version":3,"timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"Send a question."}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","api":"openai-responses","provider":"openai-codex","model":"gpt-5.6-luna","responseId":"resp_1","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"call_H1|fc_020","name":"bash","arguments":{"command":"cd /tmp/2pane-workflow-eval-workdir && ./2pane send 'question'"}},{"type":"toolCall","id":"call_H2|fc_021","name":"bash","arguments":{"command":"cd '/tmp/2pane-workflow-eval-workdir' && cd . && ./2pane take"}},{"type":"toolCall","id":"call_H3|fc_022","name":"bash","arguments":{"command":"cd /tmp/x && ./2pane send 'a && b'"}},{"type":"toolCall","id":"call_H4|fc_023","name":"bash","arguments":{"command":"cd /tmp/x && ./2pane send 'q' | tee /tmp/log"}},{"type":"toolCall","id":"call_H5|fc_024","name":"bash","arguments":{"command":"cd /tmp/x && ls && ./2pane take"}},{"type":"toolCall","id":"call_H6|fc_025","name":"bash","arguments":{"command":"cd /tmp/x && ./2pane take && ls -la"}},{"type":"toolCall","id":"call_H7|fc_026","name":"bash","arguments":{"command":"cd /tmp/x && ./2pane status"}}],"usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110,"cost":{"input":0.01,"output":0.001,"cacheRead":0,"cacheWrite":0,"total":0.011}}}}
+EOF
+
+  expect_eq "cd-prefix: inert cd && helper counts as the helper it ran" \
+    "$(grader_helper_calls "$TMP/cd-prefix.jsonl" | wc -l | tr -d ' ')" "3"
+  expect_eq "cd-prefix: subcommands in JSONL order (quoted && stays data)" \
+    "$(grader_helper_calls "$TMP/cd-prefix.jsonl" | cut -f3 | tr '\n' ' ')" "send take send "
+  expect_eq "cd-prefix: piped helper still rejected" \
+    "$(grader_helper_calls "$TMP/cd-prefix.jsonl" | grep -c 'call_H4' || true)" "0"
+  expect_eq "cd-prefix: non-cd middle segment still rejected" \
+    "$(grader_helper_calls "$TMP/cd-prefix.jsonl" | grep -c 'call_H5' || true)" "0"
+  expect_eq "cd-prefix: helper must be the last segment" \
+    "$(grader_helper_calls "$TMP/cd-prefix.jsonl" | grep -c 'call_H6' || true)" "0"
+  expect_eq "cd-prefix: cd-prefixed non-send/take still rejected" \
+    "$(grader_helper_calls "$TMP/cd-prefix.jsonl" | grep -c 'call_H7' || true)" "0"
+
+  # The defense-in-depth pair: `cd …/.2pane && ./2pane take` passes the
+  # helper-shape rule (cd prefix + standalone helper) — the forbidden-path
+  # scan over serialized arguments is what catches it.
+  cat >"$TMP/cd-dot2pane.jsonl" <<'EOF'
+{"type":"message","id":"e2","parentId":null,"timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"call_H8|fc_027","name":"bash","arguments":{"command":"cd /tmp/2pane-workflow-eval-workdir/.2pane && ./2pane take"}}]}}
+EOF
+  expect_eq "cd-prefix: cd-into-.2pane has helper shape" \
+    "$(grader_helper_calls "$TMP/cd-dot2pane.jsonl" | grep -c 'call_H8' || true)" "1"
+  expect_eq "cd-prefix: cd-into-.2pane still forbidden by the args scan" \
+    "$(grader_forbidden_calls "$TMP/cd-dot2pane.jsonl" | grep -c 'call_H8' || true)" "1"\
 
   local helpers
   helpers="$(grader_helper_calls "$TMP/take-then-send.jsonl")"
