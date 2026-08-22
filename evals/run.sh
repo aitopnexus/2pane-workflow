@@ -21,17 +21,33 @@
 #              docs), verbatim mode+task prompt, fingerprint-addressed
 #              immutable store with an atomic active marker, reuse with no
 #              model call, --refresh-baseline, publication only on pass.
+#   ticket 06: economy E1 driver — a fresh Main-Model session receives the
+#              mode instruction plus the verbatim task; the driver acts purely
+#              as a human-router (inbox state decides who acts next), starts
+#              or continues one Expert session per consultation cycle with
+#              AGENT_ROLE=expert, resumes each role's single JSONL via pi
+#              --session so context and usage never reset, counts zero
+#              consultations as expert-skipped, and rails the whole run with
+#              a wall-clock timeout and a pi-turn cap (both infra-fail).
+#   ticket 07: economy verdict — median summed-Expert-tokens saving against
+#              the immutable cached baseline, post-run --min-expert-saving
+#              gate (economy-fail), per-result baseline reference (id,
+#              fingerprint, session hash, usage snapshot), exploratory marker
+#              on single-sample comparisons, and the full token+money cost
+#              report (Main vs Expert vs baseline, Expert share).
 #
 # Usage:
 #   evals/run.sh self-test
 #   evals/run.sh protocol --main-model SPEC [--runs N] [--timeout SEC]
 #   evals/run.sh baseline --expert-model SPEC [--timeout SEC]
 #                        [--refresh-baseline]
-#
-# Not implemented yet: economy (ticket 06/07).
+#   evals/run.sh economy --main-model SPEC --expert-model SPEC
+#                        [--runs N] [--timeout SEC] [--run-timeout SEC]
+#                        [--turn-cap N] [--min-expert-saving PCT]
+#                        [--baseline-id ID]
 #
 # Exit codes: 0 pass · 1 protocol-fail · 2 usage error · 3 infra-fail ·
-#             4 lock busy
+#             4 lock busy · 5 economy-fail · 6 baseline-missing
 set -eu
 
 usage() {
@@ -53,14 +69,23 @@ Commands:
                                    reused with no model call;
                                    --refresh-baseline forces a new immutable
                                    baseline and repoints the active marker
-  economy [--main-model SPEC
-           --expert-model SPEC]  Two-pane vs cached baseline (ticket 06/07)
+  economy --main-model SPEC        E1 two-pane vs the cached Expert-only
+          --expert-model SPEC     baseline (tickets 06/07). The driver only
+    [--runs N]                    routes by inbox state; Main alone decides
+    [--timeout SEC]               how often to consult. Rails: --run-timeout
+    [--run-timeout SEC]           (wall clock, default 600s) and --turn-cap
+    [--turn-cap N]                (pi turns, default 8); either triggering is
+    [--min-expert-saving PCT]     infra-fail. --min-expert-saving is a strict
+    [--baseline-id ID]            post-run gate (economy-fail). A missing
+                                  baseline exits 6 before any model call;
+                                  --baseline-id pins a specific stored run
 
 Options:
   -h, --help                     Show this help
 
 Exit codes:
-  0 pass · 1 protocol-fail · 2 usage error · 3 infra-fail · 4 lock busy
+  0 pass · 1 protocol-fail · 2 usage error · 3 infra-fail · 4 lock busy ·
+  5 economy-fail · 6 baseline-missing
 EOF
 }
 
@@ -239,6 +264,18 @@ unexpected_resources() {
   awk -F'\t' -v pinned="$2" '
     $1 == "skill-read" && $2 == pinned { next }
     NF >= 2 { print }' <<<"$1"
+}
+
+# grader_models_unique SESS — sorted unique provider/model pairs seen across
+# every assistant message and model_change entry of one session. A continued
+# (resumed) session must still report exactly the requested pair.
+grader_models_unique() {
+  jq -s -r '
+    [ .[] | select(.type == "message" and .message.role == "assistant")
+      | "\(.message.provider // "")/\(.message.responseModel // .message.model // "")" ]
+    + [ .[] | select(.type == "model_change")
+      | "\(.provider // "")/\(.modelId // "")" ]
+    | unique | .[]' "$1"
 }
 
 # grader_usage FILE — usage totals as JSON. Sums usage from every assistant
@@ -477,14 +514,21 @@ parse_model_spec() {
 # checks are the caller's; everything here is suite-independent.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# run_pi_once RUN_DIR SESSIONS_DIR MODEL_SPEC PROMPT TIMEOUT_SEC — run one pi
-# process and grade the infra gates. Uses REQ_PROVIDER/REQ_MODEL/REQ_THINKING
-# from parse_model_spec. Sets RUN_RC, RUN_TIMED_OUT, RUN_STARTED_AT,
-# RUN_ENDED_AT, RUN_TIMEOUT_SEC, RUN_FLAG_ARGS, RUN_SKILL_SHA, RUN_SESS,
-# RUN_JSONL_COUNT, RUN_JSONL_VALID, RUN_ACTUAL_MODELS, RUN_THINKING_OBSERVED,
-# RUN_LOADED_RESOURCES, RUN_INFRA; records the infra checks into CHECKS_FILE.
+# run_pi_once RUN_DIR SESSIONS_DIR MODEL_SPEC PROMPT TIMEOUT_SEC [RESUME_SESS]
+#   [AGENT_ROLE] — run one pi process and grade the infra gates. Uses
+# REQ_PROVIDER/REQ_MODEL/REQ_THINKING from parse_model_spec. RESUME_SESS (a
+# session file path) appends `--session <path>` so the turn continues that
+# role's existing JSONL instead of starting a new one. AGENT_ROLE (main|
+# expert) is exported for the process instead of being unset — the economy
+# suite runs its Expert turns with the expert role so ./2pane send/take
+# address the right pane; protocol and baseline runs keep it unset (Main).
+# Sets RUN_RC, RUN_TIMED_OUT, RUN_STARTED_AT, RUN_ENDED_AT, RUN_TIMEOUT_SEC,
+# RUN_FLAG_ARGS, RUN_SKILL_SHA, RUN_SESS, RUN_JSONL_COUNT, RUN_JSONL_VALID,
+# RUN_ACTUAL_MODELS, RUN_THINKING_OBSERVED, RUN_LOADED_RESOURCES, RUN_INFRA;
+# records the infra checks into CHECKS_FILE.
 run_pi_once() {
   local run_dir="$1" sessions_dir="$2" model_spec="$3" prompt="$4" timeout_sec="$5"
+  local resume_sess="${6-}" run_role="${7-}"
   RUN_TIMEOUT_SEC="$timeout_sec"
   RUN_SKILL_SHA="$($EVAL_SHA256 "$EVAL_WORKDIR/.agents/skills/$EVAL_PINNED_SKILL/SKILL.md" | awk '{print $1}')"
 
@@ -494,13 +538,24 @@ run_pi_once() {
   RUN_STARTED_AT="$started_at"
 
   # One pi call: fixed cwd, reset env, pinned flags, per-call timeout.
+  # AGENT_ROLE is exported (not unset) when a role is requested; everything
+  # else stays reset.
   local flag_args=()
   while IFS= read -r f; do flag_args+=("$f"); done < <(eval_pi_flags "$model_spec" "$sessions_dir")
+  if [ -n "$resume_sess" ]; then
+    flag_args+=(--session "$resume_sess")
+  fi
+  local env_args=() v
+  for v in "${EVAL_ENV_RESET[@]}"; do
+    if [ "$v" = AGENT_ROLE ] && [ -n "$run_role" ]; then continue; fi
+    env_args+=(-u "$v")
+  done
+  [ -n "$run_role" ] && env_args+=("AGENT_ROLE=$run_role")
   RUN_FLAG_ARGS=("${flag_args[@]}")
   (
     cd "$EVAL_WORKDIR"
     # shellcheck disable=SC2046  # intentional splitting into repeated -u NAME args
-    exec env $(printf -- '-u %s ' "${EVAL_ENV_RESET[@]}") \
+    exec env "${env_args[@]}" \
       "$EVALS_PI_BIN" "${flag_args[@]}" "$prompt" </dev/null
   ) >"$run_dir/pi.log" 2>&1 &
   EVAL_RUN_PID=$!
@@ -545,12 +600,7 @@ run_pi_once() {
   # provider/model — a mismatch or a mid-session change is infra-fail.
   local actual_models="" model_ok=0 thinking_observed="" thinking_ok=1
   if [ "$jsonl_valid" = 1 ]; then
-    actual_models=$(jq -s -r '
-      [ .[] | select(.type == "message" and .message.role == "assistant")
-        | "\(.message.provider // "")/\(.message.responseModel // .message.model // "")" ]
-      + [ .[] | select(.type == "model_change")
-        | "\(.provider // "")/\(.modelId // "")" ]
-      | unique | .[]' "$sess")
+    actual_models="$(grader_models_unique "$sess")"
     if [ "$(printf '%s\n' "$actual_models" | grep -c .)" = 1 ] \
       && [ "$actual_models" = "$REQ_PROVIDER/$REQ_MODEL" ]; then
       model_ok=1
@@ -1154,6 +1204,23 @@ $ECON_FINAL_LINE2" ] && v=1
   protocol_checks_common baseline "$run_dir" "$sess"
 }
 
+# econ_fingerprint EXPERT_SPEC PROMPT_FILE MANIFEST_FILE — compute the
+# baseline fingerprint components from the CURRENT fixture (the caller must
+# have rebuilt the economy fixture and written the manifest first; the
+# verbatim baseline prompt bytes go to PROMPT_FILE). Sets ECON_FP,
+# ECON_PI_VERSION, ECON_PROMPT_SHA, ECON_MANIFEST_SHA, ECON_PINNED_ENV.
+# Shared by `baseline` and `economy` so both hash byte-identical components.
+econ_fingerprint() {
+  local expert_spec="$1" prompt_file="$2" manifest_file="$3"
+  econ_baseline_prompt >"$prompt_file"
+  ECON_PROMPT_SHA="$($EVAL_SHA256 "$prompt_file" | awk '{print $1}')"
+  ECON_PI_VERSION="$($EVALS_PI_BIN --version 2>/dev/null | head -n1)"
+  ECON_MANIFEST_SHA="$($EVAL_SHA256 "$manifest_file" | awk '{print $1}')"
+  ECON_PINNED_ENV="$(pinned_env_digest "$expert_spec")"
+  ECON_FP="$(baseline_fingerprint "$expert_spec" "$ECON_PI_VERSION" \
+    "$ECON_PROMPT_SHA" "$ECON_MANIFEST_SHA" "$ECON_PINNED_ENV")"
+}
+
 # cmd_baseline --expert-model SPEC [--timeout SEC] [--refresh-baseline] —
 # create or reuse the persistent Expert-only baseline. Fingerprint first: a
 # valid active baseline short-circuits before any model call; a fresh run is
@@ -1195,15 +1262,10 @@ cmd_baseline() {
   # Rebuild the pristine economy fixture, then hash every fingerprint
   # component from it (prompt bytes, manifest, pinned environment).
   fixture_rebuild_economy
-  local prompt prompt_sha pi_version manifest_sha pinned_env fp
-  prompt="$(econ_baseline_prompt)"
-  printf '%s\n' "$prompt" >"$run_dir/prompt.txt"
   manifest_of "$EVAL_WORKDIR" >"$run_dir/before-manifest.sha256"
-  prompt_sha="$($EVAL_SHA256 "$run_dir/prompt.txt" | awk '{print $1}')"
-  pi_version="$($EVALS_PI_BIN --version 2>/dev/null | head -n1)"
-  manifest_sha="$($EVAL_SHA256 "$run_dir/before-manifest.sha256" | awk '{print $1}')"
-  pinned_env="$(pinned_env_digest "$expert_spec")"
-  fp="$(baseline_fingerprint "$expert_spec" "$pi_version" "$prompt_sha" "$manifest_sha" "$pinned_env")"
+  econ_fingerprint "$expert_spec" "$run_dir/prompt.txt" "$run_dir/before-manifest.sha256"
+  local prompt_sha="$ECON_PROMPT_SHA" pi_version="$ECON_PI_VERSION" \
+    manifest_sha="$ECON_MANIFEST_SHA" pinned_env="$ECON_PINNED_ENV" fp="$ECON_FP"
 
   local active_id=""
   if [ "$refresh" != 1 ] && active_id="$(baseline_active_id "$EVAL_BASELINES_DIR/$fp")"; then
@@ -1225,7 +1287,7 @@ cmd_baseline() {
   CHECK_FAIL=0
   : >"$CHECKS_FILE"
 
-  run_pi_once "$run_dir" "$sessions_dir" "$expert_spec" "$prompt" "$timeout_sec"
+  run_pi_once "$run_dir" "$sessions_dir" "$expert_spec" "$(cat "$run_dir/prompt.txt")" "$timeout_sec"
 
   manifest_of "$EVAL_WORKDIR" >"$run_dir/after-manifest.sha256"
 
@@ -1326,6 +1388,590 @@ cmd_baseline() {
     protocol-fail) return 1 ;;
     *) return 3 ;;
   esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Economy suite — E1 two-pane driver + verdict layer (tickets 06/07)
+#
+# E1 runs the cheap Main-Model over the economy task with the two-pane
+# helper available. The driver is purely a human-router: it never decides
+# consultations — after every pi turn it looks at the inbox, and the first
+# line routes the next turn (`from: main` → Expert acts, `from: expert` →
+# Main acts, empty after a Main turn → the run is over). Main and Expert each
+# own ONE session JSONL; every continued turn resumes it via pi --session so
+# context and usage accumulate instead of resetting. Expert turns run with
+# AGENT_ROLE=expert (the only way ./2pane addresses the right pane). Zero
+# consultations is legal and reported as expert-skipped. Rails: overall
+# wall-clock timeout and a pi-turn cap — either triggering is infra-fail,
+# never a fake saving; nothing limits Expert during the run. The verdict
+# layer (07) compares the median summed-Expert-tokens across E1 runs against
+# the immutable cached baseline: post-run --min-expert-saving gate, baseline
+# reference per result, exploratory flag on single samples, full token+money
+# cost report.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ECON_MAIN_MODE='Work on the following task as Main. Use the two-pane Expert whenever you think it helps; you may also finish without consulting Expert.'
+ECON_EXPERT_TURN_PROMPT='You are the Expert pane of the two-pane workflow. A question from Main is waiting in the inbox: take it with ./2pane take, answer it yourself, and send your complete reply through ./2pane send.'
+ECON_MAIN_REPLY_PROMPT='The Expert sent a reply. Check the two-pane workflow for the incoming message with ./2pane take, then finish the task.'
+ECON_MAIN_EMPTY_PROMPT='The inbox is empty. Finish the task.'
+EVAL_ECON_RUN_TIMEOUT=600
+EVAL_ECON_TURN_CAP=8
+EVAL_ECON_MIN_SAVING=0
+# Zero-usage placeholder for a role that never ran (expert-skipped runs).
+ECON_ZERO_USAGE='{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0},"modelCalls":0,"toolCalls":0}'
+
+econ_main_prompt() { printf '%s\n\n%s\n' "$ECON_MAIN_MODE" "$ECON_TASK_TEXT"; }
+
+# econ_median NUM... — the median of the arguments; an even count averages
+# the two middle values. Integer arguments produce integer or .5 output.
+econ_median() {
+  [ "$#" -ge 1 ] || return 1
+  printf '%s\n' "$@" | jq -s '
+    sort |
+    if length % 2 == 1 then .[(length - 1) / 2]
+    else ((.[length / 2 - 1] + .[length / 2]) / 2)
+    end'
+}
+
+# econ_saving_percent SUM BASELINE — expertSavingPercent rounded to two
+# decimals: 100 * (1 - median summed Expert tokens / baseline tokens). A
+# zero/negative baseline (never published, but guarded) counts as full
+# saving only when SUM is also zero.
+econ_saving_percent() {
+  jq -n --argjson s "$1" --argjson b "$2" '
+    (if ($b | tonumber) <= 0 then
+       (if ($s | tonumber) == 0 then 100 else 0 end)
+     else 100 * (1 - (($s | tonumber) / ($b | tonumber))) end)
+    | ((. * 100 | round) / 100)'
+}
+
+# econ_inbox_from — the first line of the live inbox ("from: main",
+# "from: expert" or empty for an empty/missing inbox).
+econ_inbox_from() {
+  head -n1 "$EVAL_WORKDIR/.2pane/INBOX.md" 2>/dev/null || true
+}
+
+# econ_resolve_baseline PINNED_ID — locate the cached Expert-only baseline for
+# the current ECON_FP. Sets BL_ID, BL_DIR, BL_USAGE_JSON, BL_TOTAL_TOKENS,
+# BL_COST_TOTAL, BL_SESSION_SHA. Returns 0 when usable, 1 when missing
+# (caller reports baseline-missing, exit 6) and 2 when a pinned id exists but
+# its stored fingerprint does not match the current one (usage error).
+econ_resolve_baseline() {
+  local pinned="$1"
+  local fp_dir="$EVAL_BASELINES_DIR/$ECON_FP" id=""
+  if [ -n "$pinned" ]; then
+    id="$pinned"
+    [ -s "$fp_dir/$id/metadata.json" ] || return 1
+    local stored_fp
+    stored_fp="$(jq -r .fingerprint "$fp_dir/$id/metadata.json" 2>/dev/null)"
+    [ "$stored_fp" = "$ECON_FP" ] || return 2
+  else
+    id="$(baseline_active_id "$fp_dir")" || return 1
+  fi
+  BL_ID="$id"
+  BL_DIR="$fp_dir/$id"
+  BL_USAGE_JSON="$(cat "$BL_DIR/usage.json" 2>/dev/null)"
+  BL_TOTAL_TOKENS="$(jq -r '.totalTokens // 0' <<<"$BL_USAGE_JSON")"
+  BL_COST_TOTAL="$(jq -r '.cost.total // 0' <<<"$BL_USAGE_JSON")"
+  BL_SESSION_SHA="$(jq -r .sessionSha256 "$BL_DIR/metadata.json" 2>/dev/null)"
+  return 0
+}
+
+# econ_role_checks TAG SESS SPEC — the assertions shared by both E1 roles:
+# helper-only bash with scoped reads, no forbidden runtime access, and the
+# model pinned across ALL continued turns of that role's single session.
+econ_role_checks() {
+  local tag="$1" sess="$2" spec="$3"
+  local v nb nh models
+
+  v=0; [ -z "$(grader_forbidden_calls "$sess")" ] && v=1
+  check_bool "$tag: no forbidden direct runtime access in tool calls" "$v"
+
+  nb=$(grader_bash_calls "$sess" | grep -c . || true)
+  nh=$(grader_helper_calls "$sess" | grep -c . || true)
+  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
+  check_bool "$tag: every bash call is a standalone ./2pane helper invocation ($nb bash, $nh helper)" "$v"
+
+  v=0; [ -z "$(grader_reads_outside_fixture "$sess")" ] && v=1
+  check_bool "$tag: read tool used only for fixture files" "$v"
+
+  parse_model_spec "$spec"
+  models="$(grader_models_unique "$sess")"
+  v=0
+  { [ "$(printf '%s\n' "$models" | grep -c .)" = 1 ] \
+    && [ "$models" = "$REQ_PROVIDER/$REQ_MODEL" ]; } && v=1
+  check_bool "$tag: every continued turn ran $REQ_PROVIDER/$REQ_MODEL (observed: $(printf '%s' "$models" | tr '\n' ' '))" "$v"
+}
+
+# econ_checks_run RUN_DIR MAIN_SPEC EXPERT_SPEC — E1 assertions on the
+# completed run: both roles helper-only with scoped reads, models pinned
+# across ALL continued turns, the shared answer-correctness gate (exact two
+# final lines), the consultation cycle (every Main send answered by exactly
+# one Expert take/reply pair that Main consumes), and the untouched fixture.
+# Sets E1_ANSWER_OK (0/1). Appends to CHECKS_FILE.
+econ_checks_run() {
+  local run_dir="$1" main_spec="$2" expert_spec="$3"
+  local msess="$run_dir/main-session.jsonl" esess="$run_dir/expert-session.jsonl"
+  local v t
+
+  v=0; [ -s "$msess" ] && v=1
+  check_bool "E1/main: role session JSONL captured" "$v"
+
+  if [ -s "$msess" ]; then
+    econ_role_checks "E1/main" "$msess" "$main_spec"
+
+    # Answer-correctness gate shared with the baseline (E2).
+    v=0
+    if t="$(grader_final_text "$msess")"; then
+      [ "$(printf '%s\n' "$t" | tail -n 2)" = "$ECON_FINAL_LINE1
+$ECON_FINAL_LINE2" ] && v=1
+    fi
+    E1_ANSWER_OK="$v"
+    check_bool "E1/main: final answer ends with the exact two lines '$ECON_FINAL_LINE1' / '$ECON_FINAL_LINE2'" "$v"
+  else
+    E1_ANSWER_OK=0
+  fi
+
+  if [ -s "$esess" ]; then
+    econ_role_checks "E1/expert" "$esess" "$expert_spec"
+
+    # Consultation cycle: every Main send is taken by Expert exactly once,
+    # answered by exactly one Expert send, and consumed by exactly one Main
+    # take; take results carry the right `from:` line.
+    local c et es mt bad
+    c=$(grader_helper_calls "$msess" send | awk -F'\t' '$5=="ok"' | grep -c . || true)
+    et=$(grader_helper_calls "$esess" take | awk -F'\t' '$5=="ok"' | grep -c . || true)
+    es=$(grader_helper_calls "$esess" send | awk -F'\t' '$5=="ok"' | grep -c . || true)
+    mt=$(grader_helper_calls "$msess" take | awk -F'\t' '$5=="ok"' | grep -c . || true)
+    v=0; [ "$et" = "$c" ] && v=1
+    check_bool "E1/cycle: every one of $c consultations was taken by Expert exactly once (takes: $et)" "$v"
+    v=0; [ "$es" = "$c" ] && v=1
+    check_bool "E1/cycle: every consultation got exactly one Expert reply (sends: $es)" "$v"
+    v=0; [ "$mt" = "$c" ] && v=1
+    check_bool "E1/cycle: Main consumed every Expert reply exactly once (takes: $mt)" "$v"
+    bad=$(grader_helper_calls "$esess" take | awk -F'\t' '$5=="ok" && $6 !~ /from: main/' | grep -c . || true)
+    v=0; [ "${bad:-0}" = 0 ] && v=1
+    check_bool "E1/cycle: every ok Expert take returned the message from main" "$v"
+    bad=$(grader_helper_calls "$msess" take | awk -F'\t' '$5=="ok" && $6 !~ /from: expert/' | grep -c . || true)
+    v=0; [ "${bad:-0}" = 0 ] && v=1
+    check_bool "E1/cycle: every ok Main take returned the message from expert" "$v"
+  else
+    # No Expert session ever started: the zero-consultation outcome. A legal
+    # expert-skipped run must show zero consultations on the Main side too.
+    v=0; [ "${E1_CONSULTATIONS:-0}" = 0 ] && v=1
+    check_bool "E1/cycle: no Expert session and zero consultations recorded (expert-skipped)" "$v"
+  fi
+
+  v=0; cmp -s "$run_dir/before-manifest.sha256" "$run_dir/after-manifest.sha256" && v=1
+  check_bool "E1: files outside .2pane unchanged across all turns of both roles (manifest equal)" "$v"
+}
+
+# econ_drive_one RUN_ROOT MAIN_SPEC EXPERT_SPEC K PER_TIMEOUT RUN_TIMEOUT
+#   TURN_CAP BL_REF_JSON — one E1 run: fresh fixture, the human-router loop,
+# rails, session capture, grading and the per-run result row. Sets E1_STATUS,
+# E1_CONSULTATIONS, E1_EXPERT_SKIPPED, E1_ANSWER_OK, E1_TURNS, E1_WALL_SEC,
+# E1_MAIN_USAGE, E1_EXPERT_USAGE, E1_INFRA_REASON. Appends one object to
+# RUN_ROOT/.runs.ndjson and writes RUN_DIR/result.json.
+econ_drive_one() {
+  local run_root="$1" main_spec="$2" expert_spec="$3" k="$4" \
+    per_timeout="$5" run_timeout="$6" turn_cap="$7" bl_ref="$8"
+  local run_dir="$run_root/e1-r$k"
+  local main_sessions="$run_dir/sessions/main" expert_sessions="$run_dir/sessions/expert"
+  mkdir -p "$main_sessions" "$expert_sessions"
+  CHECKS_FILE="$run_dir/checks.txt"
+  CHECK_FAIL=0
+  : >"$CHECKS_FILE"
+
+  fixture_rebuild_economy
+  : >"$EVAL_WORKDIR/.2pane/INBOX.md"
+  cp "$EVAL_WORKDIR/.2pane/INBOX.md" "$run_dir/seed-INBOX.md"
+  econ_main_prompt >"$run_dir/prompt.txt"
+  printf '%s\n' "$ECON_EXPERT_TURN_PROMPT" >"$run_dir/expert-prompt.txt"
+  manifest_of "$EVAL_WORKDIR" >"$run_dir/before-manifest.sha256"
+
+  local start_sec end_sec
+  start_sec="$(date +%s)"
+  local actor="main" turn=0 main_turns=0 consultations=0 infra_reason=""
+  local main_sec=0 expert_sec=0 turn_start
+  local main_jsonl="" expert_jsonl="" prompt tdir
+
+  # The human-router loop: rails before every turn, then route on the live
+  # inbox state after it. The driver never decides consultations itself.
+  while :; do
+    local elapsed=$(( $(date +%s) - start_sec ))
+    if [ "$elapsed" -ge "$run_timeout" ]; then
+      infra_reason="wall-clock run timeout ${run_timeout}s reached"
+      break
+    fi
+    if [ "$turn" -ge "$turn_cap" ]; then
+      infra_reason="pi-turn cap ${turn_cap} reached"
+      break
+    fi
+    turn=$((turn + 1))
+    turn_start="$(date +%s)"
+    tdir="$run_dir/turns/$(printf 'T%02d' "$turn")-$actor"
+    mkdir -p "$tdir"
+
+    if [ "$actor" = main ]; then
+      main_turns=$((main_turns + 1))
+      if [ "$main_turns" = 1 ]; then
+        prompt="$(cat "$run_dir/prompt.txt")"
+      elif [ "$(econ_inbox_from)" = "from: expert" ]; then
+        prompt="$ECON_MAIN_REPLY_PROMPT"
+      else
+        prompt="$ECON_MAIN_EMPTY_PROMPT"
+      fi
+      printf '%s\n' "$prompt" >"$tdir/prompt.txt"
+      local resumed=false
+      [ "$main_turns" -gt 1 ] && resumed=true
+      parse_model_spec "$main_spec"
+      run_pi_once "$tdir" "$main_sessions" "$main_spec" "$prompt" \
+        "$per_timeout" "$main_jsonl" main
+      write_usage_json "$tdir"
+      write_run_metadata "$tdir" economy e1 "$k" main "$main_spec" \
+        "$(jq -cn --argjson turn "$turn" --arg actor main --argjson resumed "$resumed" \
+          '{turn:$turn, actor:$actor, resumed:$resumed}')"
+      main_jsonl="$(find "$main_sessions" -maxdepth 1 -name '*.jsonl' -type f | LC_ALL=C sort | head -n1)"
+      if [ "$RUN_INFRA" = 1 ]; then
+        infra_reason="infrastructure failure in main turn $turn"
+        break
+      fi
+      consultations=$(grader_helper_calls "$main_jsonl" send \
+        | awk -F'\t' '$5=="ok"' | grep -c . || true)
+    else
+      prompt="$ECON_EXPERT_TURN_PROMPT"
+      printf '%s\n' "$prompt" >"$tdir/prompt.txt"
+      local resumed=false
+      [ -n "$expert_jsonl" ] && resumed=true
+      parse_model_spec "$expert_spec"
+      run_pi_once "$tdir" "$expert_sessions" "$expert_spec" "$prompt" \
+        "$per_timeout" "$expert_jsonl" expert
+      write_usage_json "$tdir"
+      write_run_metadata "$tdir" economy e1 "$k" expert "$expert_spec" \
+        "$(jq -cn --argjson turn "$turn" --arg actor expert --argjson resumed "$resumed" \
+          '{turn:$turn, actor:$actor, resumed:$resumed}')"
+      expert_jsonl="$(find "$expert_sessions" -maxdepth 1 -name '*.jsonl' -type f | LC_ALL=C sort | head -n1)"
+      if [ "$RUN_INFRA" = 1 ]; then
+        infra_reason="infrastructure failure in expert turn $turn"
+        break
+      fi
+    fi
+
+    # Per-role duration: charge the finished turn to the role that ran it.
+    if [ "$actor" = main ]; then
+      main_sec=$((main_sec + $(date +%s) - turn_start))
+    else
+      expert_sec=$((expert_sec + $(date +%s) - turn_start))
+    fi
+
+    case "$(econ_inbox_from)" in
+      "from: main") actor="expert" ;;
+      "from: expert") actor="main" ;;
+      "")
+        if [ "$actor" = main ]; then
+          break
+        fi
+        actor="main" ;;
+      *)
+        infra_reason="inbox left in an unexpected state after turn $turn"
+        break ;;
+    esac
+  done
+
+  end_sec="$(date +%s)"
+  E1_TURNS="$turn"
+  E1_WALL_SEC="$((end_sec - start_sec))"
+  E1_MAIN_SEC="$main_sec"
+  E1_EXPERT_SEC="$expert_sec"
+  E1_CONSULTATIONS="${consultations:-0}"
+  E1_INFRA_REASON="$infra_reason"
+
+  if [ -n "$infra_reason" ]; then
+    check_note "not ok - rail: $infra_reason"
+  else
+    check_note "ok - rail: completed within wall-clock ${run_timeout}s and turn cap ${turn_cap}"
+  fi
+
+  # Capture each role's single session as a stable artifact.
+  E1_EXPERT_SKIPPED=1
+  if [ -n "$expert_jsonl" ] && [ -s "$expert_jsonl" ]; then
+    cp "$expert_jsonl" "$run_dir/expert-session.jsonl"
+    E1_EXPERT_SKIPPED=0
+  fi
+  if [ -n "$main_jsonl" ] && [ -s "$main_jsonl" ]; then
+    cp "$main_jsonl" "$run_dir/main-session.jsonl"
+  fi
+  manifest_of "$EVAL_WORKDIR" >"$run_dir/after-manifest.sha256"
+
+  E1_ANSWER_OK=0
+  if [ -n "$infra_reason" ]; then
+    check_note "# E1 checks skipped: infrastructure failure"
+  else
+    econ_checks_run "$run_dir" "$main_spec" "$expert_spec"
+  fi
+
+  local status
+  if [ -n "$infra_reason" ]; then
+    status="infra-fail"
+  elif [ "$CHECK_FAIL" -gt 0 ]; then
+    status="protocol-fail"
+  else
+    status="pass"
+  fi
+  E1_STATUS="$status"
+  printf '# classification: %s\n' "$status" >>"$CHECKS_FILE"
+
+  if [ -s "$run_dir/main-session.jsonl" ]; then
+    E1_MAIN_USAGE="$(grader_usage "$run_dir/main-session.jsonl")"
+  else
+    E1_MAIN_USAGE="$ECON_ZERO_USAGE"
+  fi
+  if [ -s "$run_dir/expert-session.jsonl" ]; then
+    E1_EXPERT_USAGE="$(grader_usage "$run_dir/expert-session.jsonl")"
+  else
+    E1_EXPERT_USAGE="$ECON_ZERO_USAGE"
+  fi
+
+  jq -n --argjson run "$k" --arg status "$status" \
+    --argjson consultations "$E1_CONSULTATIONS" --argjson turns "$E1_TURNS" \
+    --argjson expertSkipped "$E1_EXPERT_SKIPPED" --argjson answerOk "$E1_ANSWER_OK" \
+    --argjson wallSeconds "$E1_WALL_SEC" --arg infraReason "$infra_reason" \
+    --argjson mainSeconds "$E1_MAIN_SEC" --argjson expertSeconds "$E1_EXPERT_SEC" \
+    --argjson mainUsage "$E1_MAIN_USAGE" --argjson expertUsage "$E1_EXPERT_USAGE" \
+    --argjson baselineRef "$bl_ref" \
+    '{scenario:"e1", run:$run, status:$status, consultations:$consultations,
+      turns:$turns, expertSkipped:($expertSkipped==1), correctAnswer:($answerOk==1),
+      wallSeconds:$wallSeconds, mainSeconds:$mainSeconds, expertSeconds:$expertSeconds,
+      infraReason:(if $infraReason=="" then null else $infraReason end),
+      mainUsage:$mainUsage, expertUsage:$expertUsage, baselineRef:$baselineRef}' \
+    >"$run_dir/result.json"
+
+  jq -cn --argjson run "$k" --arg status "$status" \
+    --argjson consultations "$E1_CONSULTATIONS" \
+    --argjson expertSkipped "$E1_EXPERT_SKIPPED" --argjson answerOk "$E1_ANSWER_OK" \
+    --argjson mainTokens "$(jq '.totalTokens // 0' <<<"$E1_MAIN_USAGE")" \
+    --argjson mainCost "$(jq '.cost.total // 0' <<<"$E1_MAIN_USAGE")" \
+    --argjson expertTokens "$(jq '.totalTokens // 0' <<<"$E1_EXPERT_USAGE")" \
+    --argjson expertCost "$(jq '.cost.total // 0' <<<"$E1_EXPERT_USAGE")" \
+    '{scenario:"e1", run:$run, status:$status, consultations:$consultations,
+      expertSkipped:($expertSkipped==1), correctAnswer:($answerOk==1),
+      mainTokens:$mainTokens, mainCost:$mainCost,
+      expertTokens:$expertTokens, expertCost:$expertCost}' \
+    >>"$run_root/.runs.ndjson"
+
+  local ok_n
+  ok_n=$(grep -c '^ok - ' "$CHECKS_FILE" || true)
+  printf 'evals: e1-r%s: %s (%s ok, %s not ok, %s turns, %s consultations)\n' \
+    "$k" "$status" "$ok_n" "$CHECK_FAIL" "$E1_TURNS" "$E1_CONSULTATIONS"
+}
+
+# cmd_economy --main-model SPEC --expert-model SPEC [options] — resolve the
+# cached baseline (baseline-missing exits 6 BEFORE any model call), run the
+# E1 driver per repeat, then apply the verdict layer: median summed-Expert-
+# tokens saving vs the immutable baseline, post-run --min-expert-saving
+# gate, exploratory flag on single samples, full cost report.
+cmd_economy() {
+  local main_spec="" expert_spec="" runs=1 timeout_sec=$EVAL_DEFAULT_TIMEOUT \
+    run_timeout=$EVAL_ECON_RUN_TIMEOUT turn_cap=$EVAL_ECON_TURN_CAP \
+    min_saving=$EVAL_ECON_MIN_SAVING baseline_pin=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --main-model)
+        [ "$#" -ge 2 ] || eval_die "--main-model requires a value"
+        main_spec="$2"; shift 2 ;;
+      --expert-model)
+        [ "$#" -ge 2 ] || eval_die "--expert-model requires a value"
+        expert_spec="$2"; shift 2 ;;
+      --runs)
+        [ "$#" -ge 2 ] || eval_die "--runs requires a value"
+        runs="$2"; shift 2 ;;
+      --timeout)
+        [ "$#" -ge 2 ] || eval_die "--timeout requires a value"
+        timeout_sec="$2"; shift 2 ;;
+      --run-timeout)
+        [ "$#" -ge 2 ] || eval_die "--run-timeout requires a value"
+        run_timeout="$2"; shift 2 ;;
+      --turn-cap)
+        [ "$#" -ge 2 ] || eval_die "--turn-cap requires a value"
+        turn_cap="$2"; shift 2 ;;
+      --min-expert-saving)
+        [ "$#" -ge 2 ] || eval_die "--min-expert-saving requires a value"
+        min_saving="$2"; shift 2 ;;
+      --baseline-id)
+        [ "$#" -ge 2 ] || eval_die "--baseline-id requires a value"
+        baseline_pin="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) eval_die "unknown economy option: $1" ;;
+    esac
+  done
+  [ -n "$main_spec" ] || eval_die "economy requires --main-model SPEC (provider/model[:thinking])"
+  [ -n "$expert_spec" ] || eval_die "economy requires --expert-model SPEC (provider/model[:thinking])"
+  parse_model_spec "$main_spec"
+  parse_model_spec "$expert_spec"
+  case "$runs" in ''|*[!0-9]*|0) eval_die "--runs must be a positive integer" ;; esac
+  case "$timeout_sec" in ''|*[!0-9]*|0) eval_die "--timeout must be a positive integer (seconds)" ;; esac
+  case "$run_timeout" in ''|*[!0-9]*|0) eval_die "--run-timeout must be a positive integer (seconds)" ;; esac
+  case "$turn_cap" in ''|*[!0-9]*|0) eval_die "--turn-cap must be a positive integer" ;; esac
+  awk -v x="$min_saving" 'BEGIN { if (x ~ /^-?[0-9]+([.][0-9]+)?$/) exit 0; exit 1 }' \
+    || eval_die "--min-expert-saving must be a number (percent)"
+  command -v jq >/dev/null 2>&1 || eval_die "jq is required"
+  [ -f "$REPO_ROOT/docs/spec.md" ] && [ -f "$REPO_ROOT/docs/adr/0001-single-slot-inbox.md" ] \
+    || eval_die "economy fixture requires docs/spec.md and docs/adr/0001-single-slot-inbox.md in the checkout"
+
+  local stamp run_root
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  run_root="$EVAL_RESULTS_DIR/$stamp"
+
+  trap eval_cleanup EXIT
+  trap 'exit 130' INT TERM
+  lock_acquire || exit 4
+  mkdir -p "$run_root"
+  : >"$run_root/.runs.ndjson"
+
+  # Fingerprint from the freshly rebuilt economy fixture — byte-identical to
+  # what `baseline` computes — then resolve the cached baseline BEFORE any
+  # model call: baseline-missing exits 6 without spending tokens.
+  fixture_rebuild_economy
+  manifest_of "$EVAL_WORKDIR" >"$run_root/fixture-manifest.sha256"
+  econ_fingerprint "$expert_spec" "$run_root/baseline-prompt.txt" \
+    "$run_root/fixture-manifest.sha256"
+
+  local rres=0
+  econ_resolve_baseline "$baseline_pin" || rres=$?
+  if [ "$rres" = 2 ]; then
+    eval_die "--baseline-id $baseline_pin exists but its stored fingerprint does not match the current one ($ECON_FP); drop the pin or create a matching baseline"
+  elif [ "$rres" != 0 ]; then
+    printf 'evals: baseline-missing: no cached Expert-only baseline for fingerprint %s\n' "$ECON_FP" >&2
+    printf 'evals: create one first (this spends the one expensive Expert-only run):\n' >&2
+    printf 'evals:   evals/run.sh baseline --expert-model %s\n' "$expert_spec" >&2
+    rm -rf "$run_root"
+    lock_release
+    exit 6
+  fi
+
+  printf 'evals: run root: %s\n' "$run_root"
+  printf 'evals: baseline active: %s\n' "$BL_ID"
+  printf 'evals: fingerprint: %s\n' "$ECON_FP"
+
+  # The immutable baseline reference carried by every economy result: id,
+  # fingerprint, raw-session hash and a usage snapshot.
+  jq -n --arg id "$BL_ID" --arg fp "$ECON_FP" --arg sha "$BL_SESSION_SHA" \
+    --argjson usage "$BL_USAGE_JSON" \
+    '{id:$id, fingerprint:$fp, sessionSha256:(if $sha=="" then null else $sha end),
+      totalTokens:($usage.totalTokens // 0), costTotal:($usage.cost.total // 0),
+      usage:$usage}' >"$run_root/baseline-ref.json"
+  local bl_ref
+  bl_ref="$(cat "$run_root/baseline-ref.json")"
+
+  local k any_infra=0 any_protocol=0
+  for ((k = 1; k <= runs; k++)); do
+    econ_drive_one "$run_root" "$main_spec" "$expert_spec" "$k" \
+      "$timeout_sec" "$run_timeout" "$turn_cap" "$bl_ref"
+    case "$E1_STATUS" in
+      infra-fail) any_infra=1 ;;
+      protocol-fail) any_protocol=1 ;;
+    esac
+  done
+
+  lock_release
+
+  # Verdict layer: median summed-Expert-tokens across valid E1 runs vs the
+  # single immutable baseline count. The gate is strictly post-run.
+  local n_valid median_expert="" saving="" verdict="" gate_correct=0
+  n_valid=$(jq -s '[.[] | select(.status != "infra-fail")] | length' "$run_root/.runs.ndjson")
+  if [ "$n_valid" -gt 0 ]; then
+    local -a vals=()
+    while IFS= read -r line; do vals+=("$line"); done \
+      < <(jq -r 'select(.status != "infra-fail") | .expertTokens' "$run_root/.runs.ndjson")
+    median_expert="$(econ_median "${vals[@]}")"
+    saving="$(econ_saving_percent "$median_expert" "$BL_TOTAL_TOKENS")"
+    gate_correct=$(jq -s '[.[] | select(.status != "infra-fail")
+      | select(.status == "pass" and .correctAnswer)] | length' "$run_root/.runs.ndjson")
+    verdict="economy-fail"
+    if [ "$gate_correct" = "$n_valid" ] \
+      && awk -v s="$saving" -v m="$min_saving" 'BEGIN { exit !(s >= m) }'; then
+      verdict="pass"
+    fi
+  fi
+
+  local overall overall_rc=0
+  if [ "$any_infra" = 1 ]; then
+    overall="infra-fail" overall_rc=3
+  elif [ "$any_protocol" = 1 ]; then
+    overall="protocol-fail" overall_rc=1
+  elif [ "$verdict" = economy-fail ]; then
+    overall="economy-fail" overall_rc=5
+  elif [ -z "$verdict" ]; then
+    overall="infra-fail" overall_rc=3
+  else
+    overall="pass"
+  fi
+
+  # Full cost picture in both token and money terms.
+  local totals
+  totals="$(jq -s '{mainTokens:(map(.mainTokens)|add//0), mainCost:(map(.mainCost)|add//0),
+                   expertTokens:(map(.expertTokens)|add//0), expertCost:(map(.expertCost)|add//0)}' \
+    "$run_root/.runs.ndjson")"
+  totals="$(jq -n --argjson a "$totals" --argjson b "$bl_ref" '$a
+    + {e1Cost:(($a.mainCost//0)+($a.expertCost//0)),
+       baselineTokens:($b.totalTokens//0), baselineCost:($b.costTotal//0),
+       expertTokenShare:(if (($a.mainTokens//0)+($a.expertTokens//0)) > 0
+         then (((($a.expertTokens//0)/(($a.mainTokens//0)+($a.expertTokens//0)))*10000|round)/100) else 0 end),
+       expertCostShare:(if (($a.mainCost//0)+($a.expertCost//0)) > 0
+         then (((($a.expertCost//0)/(($a.mainCost//0)+($a.expertCost//0)))*10000|round)/100) else 0 end)}')"
+
+  jq -s \
+    --arg overall "$overall" --arg verdict "$verdict" \
+    --arg mainModel "$main_spec" --arg expertModel "$expert_spec" \
+    --argjson exploratory "$([ "$runs" = 1 ] && echo true || echo false)" \
+    --argjson medianExpert "${median_expert:-null}" \
+    --argjson saving "${saving:-null}" \
+    --argjson minSaving "$min_saving" \
+    --argjson baseline "$bl_ref" --argjson totals "$totals" \
+    '{suite:"economy", overall:$overall,
+      economyVerdict:(if $verdict=="" then null else $verdict end),
+      mainModel:$mainModel, expertModel:$expertModel,
+      runs:length, exploratory:$exploratory,
+      medianExpertTokens:$medianExpert, expertSavingPercent:$saving,
+      minExpertSaving:$minSaving, baseline:$baseline, totals:$totals,
+      runResults:(map({run,status,consultations,expertSkipped,correctAnswer,
+                       mainTokens,mainCost,expertTokens,expertCost}))}' \
+    "$run_root/.runs.ndjson" >"$run_root/summary.json"
+
+  {
+    printf 'economy summary %s\n' "$stamp"
+    printf 'main=%s  expert=%s\n' "$main_spec" "$expert_spec"
+    printf 'baseline: %s (fingerprint %s)\n' "$BL_ID" "$ECON_FP"
+    printf 'baseline expert tokens: %s  cost: %s\n' "$BL_TOTAL_TOKENS" "$BL_COST_TOTAL"
+    jq -r '.runResults[]
+      | "e1-r\(.run): \(.status)"
+      + (if .expertSkipped then ", expert-skipped (0 consultations)"
+         else ", \(.consultations) consultation\(if .consultations==1 then "" else "s" end)" end)
+      + ", main \(.mainTokens) tok / \(.mainCost)"
+      + (if .expertSkipped then ", expert 0 tok / 0" else ", expert \(.expertTokens) tok / \(.expertCost)" end)' \
+      "$run_root/summary.json"
+    if [ -n "$median_expert" ]; then
+      printf 'median expert tokens: %s (across %s valid run%s)\n' \
+        "$median_expert" "$n_valid" "$([ "$n_valid" = 1 ] || printf s)"
+      printf 'expert saving: %s%% (threshold %s%%)%s\n' "$saving" "$min_saving" \
+        "$([ "$runs" = 1 ] && printf ' [exploratory: single run]')"
+      printf 'expert share of E1: tokens %s%%, cost %s%%\n' \
+        "$(jq -r .expertTokenShare <<<"$totals")" "$(jq -r .expertCostShare <<<"$totals")"
+    fi
+    jq -r '"totals: E1 main \(.totals.mainTokens) tok / \(.totals.mainCost), " +
+      "E1 expert \(.totals.expertTokens) tok / \(.totals.expertCost), " +
+      "E1 combined \(.totals.e1Cost), baseline \(.totals.baselineTokens) tok / \(.totals.baselineCost)"' \
+      "$run_root/summary.json"
+    printf 'verdict: %s\n' "${verdict:-n/a}"
+    printf 'overall: %s\n' "$overall"
+  } >"$run_root/summary.txt"
+
+  for ((k = 1; k <= runs; k++)); do
+    cat "$run_root/e1-r$k/checks.txt" 2>/dev/null || true
+  done
+  cat "$run_root/summary.txt"
+
+  return "$overall_rc"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2124,6 +2770,320 @@ $ECON_FINAL_LINE2"
 
   rm -rf "$bl_store" "$bl_bad" "$bl_crash"
 
+  # ── economy formula units (ticket 07) — zero model calls ──
+  expect_eq "econ/median: odd count picks the middle" "$(econ_median 5 1 9)" "5"
+  expect_eq "econ/median: even count averages the middle two" "$(econ_median 1 2 3 4)" "2.5"
+  expect_eq "econ/median: single value is itself" "$(econ_median 42)" "42"
+  expect_eq "econ/median: order-independent" "$(econ_median 9 1 5)" "5"
+  expect_eq "econ/saving: zero consultations → 100%" "$(econ_saving_percent 0 3911)" "100"
+  expect_eq "econ/saving: quarter usage → 75%" "$(econ_saving_percent 1000 4000)" "75"
+  expect_eq "econ/saving: multiple consultations summed first → one number" "$(econ_saving_percent 300 4000)" "92.5"
+  expect_eq "econ/saving: negative saving when E1 used more" "$(econ_saving_percent 8000 4000)" "-100"
+  expect_eq "econ/saving: two-decimal rounding" "$(econ_saving_percent 1 3)" "66.67"
+  expect_eq "econ/saving: equal usage → exactly 0%" "$(econ_saving_percent 4000 4000)" "0"
+  check "econ/saving: threshold pass at exactly the minimum" \
+    "$(awk -v s="$(econ_saving_percent 1000 4000)" -v m=75 'BEGIN { exit !(s >= m) }'; echo $?)"
+  check "econ/saving: threshold fails just below the minimum" \
+    "$(awk -v s="$(econ_saving_percent 1001 4000)" -v m=75 'BEGIN { exit !(s < m) }'; echo $?)"
+
+  # ── economy end-to-end with a stub pi (tickets 06/07) ──
+  #
+  # The stub is a state machine driven by the prompt: it recognizes the E1
+  # main turn, the expert turn and the resumed main turns, drives the REAL
+  # helper for side effects (send/take), and appends to the role session via
+  # --session exactly like real pi would (never a second JSONL).
+  cat >"$TMP/pi-econ" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf 'stub-pi 0.0.0\n'; exit 0; fi
+dir="$(dirname "$0")"
+mode="$(cat "$dir/econmode" 2>/dev/null || printf multi)"
+[ "$mode" = count ] && { printf 'called\n' >>"$dir/econcalls"; exit 0; }
+[ "$mode" = crash ] && exit 3
+sessdir=""; sessfile=""; model=""; prompt=""; prev=""
+for a in "$@"; do
+  case "$prev" in
+    --session-dir) sessdir="$a" ;;
+    --session) sessfile="$a" ;;
+    --model) model="$a" ;;
+  esac
+  prompt="$a"; prev="$a"
+done
+prov="${model%%/*}"; mid="${model#*/}"; mid="${mid%%:*}"
+[ "$mode" = endless ] && sleep 1
+role=other
+Q="'Should the workflow use OS file locking around its inbox?'"
+case "$prompt" in
+  *"as Main"*) role=main-new ;;
+  *"Expert pane"*) role=expert ;;
+  *"Expert sent a reply"*) role=main-reply ;;
+  *"inbox is empty"*) role=main-empty ;;
+esac
+sess="$sessdir/stub.jsonl"
+[ -n "$sessfile" ] && sess="$sessfile"
+n0="$$-$(date +%s 2>/dev/null || date)"
+N=0
+sess_new=0
+[ -e "$sess" ] || { printf '{"type":"session","version":3,"id":"econ","timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}\n' >"$sess"; sess_new=1; }
+tlvl="${model#*:}"
+[ "$tlvl" = "$model" ] && tlvl=""
+if [ -n "$tlvl" ] && [ "$sess_new" = 1 ]; then
+  printf '{"type":"thinking_level_change","id":"t%s","timestamp":"2026-08-22T00:00:00.100Z","thinkingLevel":"%s"}\n' "$n0" "$tlvl" >>"$sess"
+fi
+emit() { # CMD ISERROR RESULTTEXT STOPTEXT USAGEJSON — one tool call + stop msg
+  local tid="c${n0}_${N}"
+  {
+    printf '{"type":"message","id":"a%s","parentId":null,"timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"%s","name":"bash","arguments":{"command":"%s"}}],"usage":%s}}\n' "$tid" "$prov" "$mid" "$tid" "$1" "$5"
+    printf '{"type":"message","id":"b%s","parentId":null,"timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"%s","toolName":"bash","isError":%s,"content":[{"type":"text","text":"%s"}]}}\n' "$tid" "$tid" "$2" "$3"
+    printf '{"type":"message","id":"d%s","parentId":null,"timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"stop","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"text","text":"%s"}],"usage":%s}}\n' "$tid" "$prov" "$mid" "$4" "$5"
+  } >>"$sess"
+  N=$((N + 1))
+}
+final() { # STOPTEXT USAGEJSON — a bare final message
+  local tid="f${n0}_${N}"
+  printf '{"type":"message","id":"%s","parentId":null,"timestamp":"2026-08-22T00:00:04.000Z","message":{"role":"assistant","provider":"%s","model":"%s","stopReason":"stop","timestamp":"2026-08-22T00:00:04.000Z","content":[{"type":"text","text":"%s"}],"usage":%s}}\n' "$tid" "$prov" "$mid" "$1" "$2" >>"$sess"
+  N=$((N + 1))
+}
+UM='{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.01}}'
+UE='{"input":50,"output":10,"totalTokens":60,"cost":{"total":0.005}}'
+UH='{"input":50000,"output":5000,"totalTokens":55000,"cost":{"total":5}}'
+[ "$mode" = hog ] && UE="$UH"
+TWO='done\ndecision: no-os-lock\ninvariant: human-single-writer'
+case "$role" in
+  main-new)
+    case "$mode" in
+      skip) final "$TWO" "$UM"; printf '%b\n' "$TWO"; exit 0 ;;
+      badskip) final 'I finished it myself without a locking review.' "$UM"; printf 'I finished it myself without a locking review.\n'; exit 0 ;;
+    esac
+    ./2pane send "Does the workflow need OS file locking around its inbox?" >/dev/null
+    emit "./2pane send $Q" false '' 'I asked the Expert about OS file locking.' "$UM"
+    printf 'I asked the Expert about OS file locking.\n'
+    ;;
+  expert)
+    ./2pane take >/dev/null
+    ./2pane send 'Expert reply: the human guarantees a single writer, so no OS file locking is needed.' >/dev/null
+    emit './2pane take' false 'from: main\n\nDoes the workflow need OS file locking around its inbox?' 'Taking the question.' "$UE"
+    emit "./2pane send Expert-reply-no-OS-lock-needed" false '' 'Replied to Main.' "$UE"
+    printf 'Replied to Main.\n'
+    ;;
+  main-reply)
+    ./2pane take >/dev/null
+    emit './2pane take' false 'from: expert\n\nExpert reply: no OS file locking is needed.' 'Took the reply.' "$UM"
+    cnt="$(cat "$dir/count" 2>/dev/null || printf 0)"; cnt=$((cnt + 1)); printf '%s\n' "$cnt" >"$dir/count"
+    if [ "$mode" = endless ] || { [ "$mode" = multi ] && [ "$cnt" -lt 2 ]; }; then
+      ./2pane send 'Second question: any caveats to that conclusion?' >/dev/null
+      emit "./2pane send Second-question-any-caveats" false '' 'Consulting the Expert once more.' "$UM"
+      printf 'Consulting the Expert once more.\n'
+    else
+      final "$TWO" "$UM"; printf '%b\n' "$TWO"
+    fi
+    ;;
+  main-empty)
+    final "$TWO" "$UM"; printf '%b\n' "$TWO"
+    ;;
+esac
+exit 0
+STUB
+  chmod +x "$TMP/pi-econ"
+  run_econ() { # store stub extra-args... → sets out/rc/run_root
+    out=""
+    rc=0
+    out=$(EVALS_BASELINE_DIR="$1" EVALS_PI_BIN="$2" bash "${BASH_SOURCE[0]}" economy \
+      --main-model openai-codex/gpt-5.6-luna --expert-model openai-codex/gpt-5.6-sol \
+      --timeout 30 "${@:3}" 2>&1) || rc=$?
+    run_root=$(printf '%s\n' "$out" | sed -n 's/^evals: run root: //p' | head -n1)
+  }
+
+  # Publish one baseline for the economy suite (same stub as ticket 05).
+  local econ_store="$TMP/econ-store"
+  printf 'good\n' >"$TMP/blmode"
+  run_baseline "$econ_store" "$TMP/pi-baseline"
+  check "econ/setup: baseline published for the economy suite" \
+    "$(if [ "$rc" -eq 0 ]; then echo 0; else echo 1; fi)"
+  local econ_bl_id econ_fp_dir
+  econ_fp_dir="$(find "$econ_store" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  econ_bl_id="$(cat "$econ_fp_dir/active" 2>/dev/null)"
+
+  # A: multi-consultation run — the full Main→Expert→Main→Expert→Main cycle,
+  # both role JSONLs continued (never reset), usage accumulated.
+  printf 'multi\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ"
+  check "econ/multi: two-consultation run passes (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  check "econ/multi: classification is pass" \
+    "$(grep -q '^# classification: pass$' "$run_root/e1-r1/checks.txt" 2>/dev/null; echo $?)"
+  expect_eq "econ/multi: two consultations counted" \
+    "$(jq -r .consultations "$run_root/e1-r1/result.json" 2>/dev/null)" "2"
+  expect_eq "econ/multi: five pi turns driven by inbox state" \
+    "$(jq -r .turns "$run_root/e1-r1/result.json" 2>/dev/null)" "5"
+  check "econ/multi: roles alternate by turn dir" \
+    "$(for d in T01-main T02-expert T03-main T04-expert T05-main; do
+         [ -d "$run_root/e1-r1/turns/$d" ] || exit 1
+       done; echo $?)"
+  check "econ/multi: each role kept exactly ONE session JSONL" \
+    "$(if [  "$(find "$run_root/e1-r1/sessions/main" -name '*.jsonl' | wc -l | tr -d ' ')" = 1 ] \
+       && [ "$(find "$run_root/e1-r1/sessions/expert" -name '*.jsonl' | wc -l | tr -d ' ')" = 1 ]; then echo 0; else echo 1; fi)"
+  expect_eq "econ/multi: main usage accumulated across 3 turns (9 assistant msgs)" \
+    "$(grader_usage "$run_root/e1-r1/main-session.jsonl" | jq -r .modelCalls)" "9"
+  expect_eq "econ/multi: expert usage accumulated across 2 turns (8 assistant msgs)" \
+    "$(grader_usage "$run_root/e1-r1/expert-session.jsonl" | jq -r .modelCalls)" "8"
+  expect_eq "econ/multi: summed expert totalTokens feeds the comparison" \
+    "$(grader_usage "$run_root/e1-r1/expert-session.jsonl" | jq -r .totalTokens)" "480"
+  check "econ/multi: per-role durations recorded (3 main turns, 2 expert turns)" \
+    "$(jq -e '.mainSeconds >= 0 and .expertSeconds >= 0 and .wallSeconds >= (.mainSeconds + .expertSeconds) - 2' \
+       "$run_root/e1-r1/result.json" >/dev/null; echo $?)"
+  check "econ/multi: baseline reference pins id, fingerprint and usage snapshot" \
+    "$(jq -e --arg id "$econ_bl_id" '.baselineRef.id==$id and (.baselineRef.fingerprint|length==64) and .baselineRef.totalTokens==3300 and .baselineRef.sessionSha256!=null' \
+       "$run_root/e1-r1/result.json" >/dev/null; echo $?)"
+  check "econ/multi: summary computes median, saving and verdict" \
+    "$(jq -e --arg id "$econ_bl_id" '.medianExpertTokens==480 and .expertSavingPercent==85.45 and .economyVerdict=="pass" and .exploratory==true and .overall=="pass" and .baseline.id==$id' \
+       "$run_root/summary.json" >/dev/null; echo $?)"
+  check "econ/multi: cost report shows both modes and expert share" \
+    "$(jq -e '.totals.mainTokens>0 and .totals.expertTokens==480 and .totals.e1Cost>0 and .totals.baselineTokens==3300 and .totals.expertTokenShare>0 and .totals.expertCostShare>0' \
+       "$run_root/summary.json" >/dev/null; echo $?)"
+  check "econ/multi: transition checks recorded" \
+    "$(grep -q '^ok - E1/cycle: every consultation got exactly one Expert reply (sends: 2)$' \
+       "$run_root/e1-r1/checks.txt" && grep -q '^ok - E1/main: final answer ends with the exact two lines' \
+       "$run_root/e1-r1/checks.txt"; echo $?)"
+  local econ_root_a="$run_root"
+
+  # B: same compliant run, but the threshold is missed → economy-fail.
+  printf 'multi\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ" --min-expert-saving 90
+  check "econ/threshold: missed saving is economy-fail (rc=$rc)" "$(if [  "$rc" -eq 5  ]; then echo 0; else echo 1; fi)"
+  check "econ/threshold: verdict recorded with runs still passing" \
+    "$(jq -e '.overall=="economy-fail" and .economyVerdict=="economy-fail" and .runResults[0].status=="pass" and .expertSavingPercent==85.45 and .minExpertSaving==90' \
+       "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # C: negative saving — Expert hogs tokens; nothing limits it during the run,
+  # the gate only fires afterwards.
+  printf 'hog\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ"
+  check "econ/hog: unrestricted Expert use is not stopped mid-run (rc=$rc)" "$(if [  "$rc" -eq 5  ]; then echo 0; else echo 1; fi)"
+  check "econ/hog: negative saving graded economy-fail" \
+    "$(jq -e '.economyVerdict=="economy-fail" and .expertSavingPercent < 0 and .runResults[0].status=="pass"' \
+       "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # D: expert-skipped — zero consultations is legal, distinct and free.
+  printf 'skip\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ"
+  check "econ/skip: zero-consultation run passes (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  check "econ/skip: labeled expert-skipped with zero Expert usage" \
+    "$(jq -e '.runResults[0].expertSkipped==true and .runResults[0].consultations==0 and .runResults[0].expertTokens==0' \
+       "$run_root/summary.json" >/dev/null; echo $?)"
+  check "econ/skip: no Expert session ever started" \
+    "$(if [  "$(find "$run_root/e1-r1/sessions/expert" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+       && [ ! -e "$run_root/e1-r1/expert-session.jsonl" ]; then echo 0; else echo 1; fi)"
+  check "econ/skip: zero Expert duration recorded" \
+    "$(jq -e '.expertSeconds == 0 and .mainSeconds >= 0' \
+       "$run_root/e1-r1/result.json" >/dev/null; echo $?)"
+  expect_eq "econ/skip: expert-skipped summary line present" \
+    "$(grep -c 'expert-skipped (0 consultations)' "$run_root/summary.txt" || true)" "1"
+  check "econ/skip: full saving against the baseline" \
+    "$(jq -e '.expertSavingPercent==100 and .economyVerdict=="pass"' "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # E: correct-but-wrong answer — badskip answers incorrectly without Expert;
+  # a wrong answer never counts as a saving.
+  printf 'badskip\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ"
+  check "econ/badskip: wrong answer is protocol-fail (rc=$rc)" "$(if [  "$rc" -eq 1  ]; then echo 0; else echo 1; fi)"
+  check "econ/badskip: two-line assertion flagged" \
+    "$(grep -q '^not ok - E1/main: final answer ends with the exact two lines' \
+       "$run_root/e1-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "econ/badskip: incorrect answers never count as savings" \
+    "$(jq -e '.runResults[0].correctAnswer==false and .overall!="pass"' "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # F: baseline-missing — exits 6 before any model call, printing the command.
+  rm -f "$TMP/econcalls"
+  printf 'count\n' >"$TMP/econmode"
+  run_econ "$TMP/econ-empty-store" "$TMP/pi-econ"
+  check "econ/missing: exits baseline-missing (rc=$rc)" "$(if [  "$rc" -eq 6  ]; then echo 0; else echo 1; fi)"
+  check "econ/missing: message names baseline-missing" \
+    "$(printf '%s\n' "$out" | grep -q 'baseline-missing'; echo $?)"
+  check "econ/missing: exact creation command printed" \
+    "$(printf '%s\n' "$out" | grep -qF 'evals/run.sh baseline --expert-model openai-codex/gpt-5.6-sol'; echo $?)"
+  check "econ/missing: no model call made" "$(if [  ! -e "$TMP/econcalls" ]; then echo 0; else echo 1; fi)"
+  check "econ/missing: no run artifacts created" \
+    "$(if [  -z "$run_root" ] || [ ! -e "$run_root" ]; then echo 0; else echo 1; fi)"
+
+  # G: turn cap rail — endless consultation loop stops as infra-fail.
+  printf 'endless\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ" --turn-cap 3 --run-timeout 120
+  check "econ/turn-cap: cap triggers infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "econ/turn-cap: rail recorded distinctly" \
+    "$(grep -q '^not ok - rail: pi-turn cap 3 reached$' "$run_root/e1-r1/checks.txt" 2>/dev/null; echo $?)"
+  expect_eq "econ/turn-cap: exactly three pi turns ran" \
+    "$(find "$run_root/e1-r1/turns" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" "3"
+  check "econ/turn-cap: no fake saving claimed" \
+    "$(jq -e '.economyVerdict==null and .overall=="infra-fail"' "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # H: wall-clock rail — a slow endless loop stops as infra-fail.
+  printf 'endless\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ" --run-timeout 3 --turn-cap 100
+  check "econ/run-timeout: wall clock triggers infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "econ/run-timeout: rail recorded distinctly" \
+    "$(grep -q '^not ok - rail: wall-clock run timeout 3s reached$' \
+       "$run_root/e1-r1/checks.txt" 2>/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # I: baseline pinning — exact id reused; bogus id is baseline-missing; a
+  # stored fingerprint mismatch is refused loudly.
+  printf 'skip\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ" --baseline-id "$econ_bl_id"
+  check "econ/pin: pinned id resolves and runs (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  check "econ/pin: summary references the pinned baseline" \
+    "$(jq -e --arg id "$econ_bl_id" '.baseline.id==$id' "$run_root/summary.json" >/dev/null; echo $?)"
+  rm -rf "$run_root"
+  run_econ "$econ_store" "$TMP/pi-econ" --baseline-id bl-nonexistent
+  check "econ/pin: unknown id is baseline-missing (rc=$rc)" "$(if [  "$rc" -eq 6  ]; then echo 0; else echo 1; fi)"
+  rm -rf "$run_root" 2>/dev/null || true
+  local econ_bad="$TMP/econ-bad-store"
+  rm -rf "$econ_bad"
+  cp -R "$econ_store" "$econ_bad"
+  local bad_fp_dir; bad_fp_dir="$(find "$econ_bad" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  jq --arg fp ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+    '.fingerprint = $fp' "$bad_fp_dir/$econ_bl_id/metadata.json" >"$bad_fp_dir/$econ_bl_id/metadata.json.tmp" \
+    && mv "$bad_fp_dir/$econ_bl_id/metadata.json.tmp" "$bad_fp_dir/$econ_bl_id/metadata.json"
+  run_econ "$econ_bad" "$TMP/pi-econ" --baseline-id "$econ_bl_id"
+  check "econ/pin: fingerprint mismatch refused as usage error (rc=$rc)" "$(if [  "$rc" -eq 2  ]; then echo 0; else echo 1; fi)"
+  rm -rf "$run_root" 2>/dev/null || true
+  rm -rf "$econ_bad"
+
+  # J: two economy runs with different Main models share ONE baseline, and
+  # the second run creates no new Expert-only session.
+  local n_before
+  n_before="$(find "$econ_store" -mindepth 2 -maxdepth 2 -type d | wc -l | tr -d ' ')"
+  printf 'multi\n' >"$TMP/econmode"
+  rm -f "$TMP/count"
+  run_econ "$econ_store" "$TMP/pi-econ"   # main = openai-codex/gpt-5.6-luna
+  check "econ/shared-1: first run passes (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  local id_first; id_first="$(jq -r .baseline.id "$run_root/summary.json")"
+  rm -rf "$run_root"
+  rc=0
+  out=$(EVALS_BASELINE_DIR="$econ_store" EVALS_PI_BIN="$TMP/pi-econ" bash "${BASH_SOURCE[0]}" economy \
+    --main-model openai-codex/gpt-5.6-luna:high --expert-model openai-codex/gpt-5.6-sol \
+    --timeout 30 2>&1) || rc=$?
+  run_root=$(printf '%s\n' "$out" | sed -n 's/^evals: run root: //p' | head -n1)
+  check "econ/shared-2: second run with another Main passes (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  check "econ/shared-2: same baseline id reused" \
+    "$(if [  "$(jq -r .baseline.id "$run_root/summary.json" 2>/dev/null)" = "$id_first" ]; then echo 0; else echo 1; fi)"
+  expect_eq "econ/shared-2: no new Expert-only baseline created" \
+    "$(find "$econ_store" -mindepth 2 -maxdepth 2 -type d | wc -l | tr -d ' ')" "$n_before"
+  rm -rf "$run_root"
+
+  rm -rf "$econ_store" "$econ_root_a" "$TMP/econ-empty-store" 2>/dev/null || true
+
   # Lock conflict: a held lock must stop a second runner before any run.
   mkdir -p "$EVAL_LOCKDIR"; printf '99999\n' >"$EVAL_LOCKDIR/pid"
   rc=0
@@ -2150,9 +3110,7 @@ main() {
     self-test) shift; self_test "$@" ;;
     protocol) shift; cmd_protocol "$@" ;;
     baseline) shift; cmd_baseline "$@" ;;
-    economy)
-      printf 'evals: %s suite is not implemented yet\n' "$1" >&2
-      exit 2 ;;
+    economy) shift; cmd_economy "$@" ;;
     -h|--help) usage ;;
     *) usage_error "unknown command: $1" ;;
   esac

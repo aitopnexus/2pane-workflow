@@ -1,0 +1,18 @@
+# 06: Economy E1 two-pane driver with per-role continued sessions
+
+**What to build:** `evals/run.sh economy --main-model <spec> --expert-model <spec>` executes the E1 mode end to end: a fresh Main-Model session receives the mode instruction and the fixed task text, and the driver acts purely as human-router. When Main publishes an inbox message `from: main`, the driver starts (or continues) a single Expert session with the Expert role and Expert model; when Expert replies `from: expert`, the driver continues the same Main session announcing the waiting reply; the loop repeats until Main produces its final answer and no message is left waiting. Every continued turn appends to the role's existing raw JSONL via session resume so context and usage are never reset. The number of consultations is entirely Main's decision — zero is legal and is reported distinctly as an expert-skipped outcome. Safety rails: overall wall-clock run timeout and a pi-turn cap whose triggering is an `infra-fail`, never a fake saving; no token budget or consultation limit during the run. If no matching cached baseline exists, the command exits `baseline-missing` before any model call and prints the exact command to create one. E1 protocol assertions hold on every transition, both roles stay helper-only, and Main's final answer ends with the exact two decision/invariant lines.
+
+**Blocked by:** 02: Protocol harness, fixture and first end-to-end S1 run; 05: Persistent Expert baseline cache and `baseline` command
+
+**Status:** resolved
+
+- [x] Main → Expert → Main cycle driven by inbox state runs to a final Main answer without driver-side consultation decisions
+- [x] All turns of a role continue that role's single JSONL; a multi-consultation self-test shows context and usage accumulating, not resetting
+- [x] Zero-consultation run completes, is labeled expert-skipped, and records zero Expert usage
+- [x] `baseline-missing` exit happens before any model call and prints the creation command
+- [x] Run timeout and turn cap produce `infra-fail` classification
+- [x] E1 assertions pass: per-transition protocol compliance, helper-only access, fixture untouched, exact two-line final answer, actual models match the requested specs
+
+## Comments
+
+Implemented in `evals/run.sh` as the `economy` command. `econ_drive_one` is the human-router: after every pi turn it reads the live inbox's first line — `from: main` starts/continues the single Expert session (run with `AGENT_ROLE=expert`, the only way `./2pane` addresses the right pane), `from: expert` continues the Main session announcing the waiting reply, and an empty inbox after a Main turn ends the run. Each role owns one session JSONL under `sessions/main/` / `sessions/expert/`; continued turns resume it via `pi --session <path>` (validated live: pi appends to the same file, still exactly one JSONL). Consultation count is recomputed from the Main session's ok `./2pane send` calls — the driver never decides consultations. Zero consultations records zero Expert usage and the `expert-skipped` label. Rails: wall-clock `--run-timeout` (default 600s) checked before every turn and `--turn-cap` (default 8) pi turns; either triggering is `infra-fail` and protocol checks are skipped. `baseline-missing` exits 6 after fingerprint resolution but before any model call, printing the exact `baseline` command. Self-tests (stub pi, zero model calls): a five-turn two-consultation run asserting usage accumulates across resumed turns (9 Main / 8 Expert assistant messages in one JSONL each), expert-skipped, baseline-missing with a call-count sentinel, turn-cap and wall-clock rails.
