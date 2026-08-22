@@ -16,12 +16,19 @@
 #              loaded-resource pinning (pinned skill reads, custom entries)
 #              with an infra gate, and a violation-matrix of negative
 #              self-tests (zero model calls).
+#   ticket 05: baseline suite — the one expensive direct-Expert reference
+#              run, cached persistently: economy fixture (helper + the two
+#              docs), verbatim mode+task prompt, fingerprint-addressed
+#              immutable store with an atomic active marker, reuse with no
+#              model call, --refresh-baseline, publication only on pass.
 #
 # Usage:
 #   evals/run.sh self-test
 #   evals/run.sh protocol --main-model SPEC [--runs N] [--timeout SEC]
+#   evals/run.sh baseline --expert-model SPEC [--timeout SEC]
+#                        [--refresh-baseline]
 #
-# Not implemented yet: baseline (ticket 05), economy (ticket 06/07).
+# Not implemented yet: economy (ticket 06/07).
 #
 # Exit codes: 0 pass · 1 protocol-fail · 2 usage error · 3 infra-fail ·
 #             4 lock busy
@@ -40,7 +47,12 @@ Commands:
                                  from a fresh fixture; summary grouped by
                                  actual Main-model. SPEC is
                                  provider/model[:thinking]
-  baseline [--expert-model SPEC] Persistent Expert baseline (ticket 05)
+  baseline --expert-model SPEC     The persistent Expert-only baseline: the
+    [--timeout SEC]                one expensive direct-Expert run over the
+    [--refresh-baseline]           economy task. A matching fingerprint is
+                                   reused with no model call;
+                                   --refresh-baseline forces a new immutable
+                                   baseline and repoints the active marker
   economy [--main-model SPEC
            --expert-model SPEC]  Two-pane vs cached baseline (ticket 06/07)
 
@@ -265,6 +277,23 @@ grader_usage() {
       }' "$1"
 }
 
+# grader_reads_outside_fixture FILE — read tool calls whose path escapes the
+# fixture: absolute paths outside the eval workdir, or relative paths with a
+# `..` component. Economy runs may read only the fixture's own files (the two
+# docs, the skill); runtime state is covered separately by the forbidden scan.
+grader_reads_outside_fixture() {
+  jq -r -s '
+    [.[] | select(.type=="message" and .message.role=="assistant")
+      | .message.content[]? | select(.type=="toolCall" and .name=="read")
+      | (.arguments.path // empty)] | .[]' "$1" | while IFS= read -r p; do
+      case "$p" in
+        "$EVAL_WORKDIR"/*) ;;
+        /*) printf '%s\n' "$p" ;;
+        ../*|*/../*|*/..|..) printf '%s\n' "$p" ;;
+      esac
+    done
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Harness: fixed eval workdir, fixture rebuild, lock, timeout, artifacts
 #
@@ -292,6 +321,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVAL_WORKDIR="/tmp/2pane-workflow-eval-workdir"
 EVAL_LOCKDIR="/tmp/2pane-workflow-eval-workdir.lock"
 EVAL_RESULTS_DIR="$REPO_ROOT/evals/results"
+# Overridable store root (EVALS_BASELINE_DIR) so stub self-tests never touch
+# the real persistent baseline cache.
+EVAL_BASELINES_DIR="${EVALS_BASELINE_DIR:-$REPO_ROOT/evals/baselines}"
 EVAL_DEFAULT_TIMEOUT=180
 EVAL_LOCK_HELD=0
 EVAL_RUN_PID=""
@@ -386,6 +418,16 @@ fixture_rebuild() {
   (cd "$EVAL_WORKDIR" && ./2pane init) >/dev/null
 }
 
+# fixture_rebuild_economy — the protocol fixture plus exactly the two docs
+# the economy task reviews; nothing else from the checkout enters the fixture.
+fixture_rebuild_economy() {
+  fixture_rebuild
+  mkdir -p "$EVAL_WORKDIR/docs/adr"
+  cp "$REPO_ROOT/docs/spec.md" "$EVAL_WORKDIR/docs/spec.md"
+  cp "$REPO_ROOT/docs/adr/0001-single-slot-inbox.md" \
+     "$EVAL_WORKDIR/docs/adr/0001-single-slot-inbox.md"
+}
+
 # Check recording: every assertion lands in the run's checks.txt as
 # `ok -` / `not ok -`; the trailing classification is appended by the caller.
 CHECKS_FILE=""
@@ -423,6 +465,186 @@ parse_model_spec() {
   case "$REQ_MODEL" in
     ""|*"/*") eval_die "invalid model id in spec: $spec" ;;
   esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared single-run engine (protocol scenarios + baseline)
+#
+# One pi process against the current fixture: pinned flags, reset env,
+# per-call timeout with trap-based cleanup, session harvest, and the infra
+# gates (exit status, timeout, JSONL count/integrity, requested/actual model
+# incl. mid-session changes, thinking level, loaded resources). Suite-specific
+# checks are the caller's; everything here is suite-independent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# run_pi_once RUN_DIR SESSIONS_DIR MODEL_SPEC PROMPT TIMEOUT_SEC — run one pi
+# process and grade the infra gates. Uses REQ_PROVIDER/REQ_MODEL/REQ_THINKING
+# from parse_model_spec. Sets RUN_RC, RUN_TIMED_OUT, RUN_STARTED_AT,
+# RUN_ENDED_AT, RUN_TIMEOUT_SEC, RUN_FLAG_ARGS, RUN_SKILL_SHA, RUN_SESS,
+# RUN_JSONL_COUNT, RUN_JSONL_VALID, RUN_ACTUAL_MODELS, RUN_THINKING_OBSERVED,
+# RUN_LOADED_RESOURCES, RUN_INFRA; records the infra checks into CHECKS_FILE.
+run_pi_once() {
+  local run_dir="$1" sessions_dir="$2" model_spec="$3" prompt="$4" timeout_sec="$5"
+  RUN_TIMEOUT_SEC="$timeout_sec"
+  RUN_SKILL_SHA="$($EVAL_SHA256 "$EVAL_WORKDIR/.agents/skills/$EVAL_PINNED_SKILL/SKILL.md" | awk '{print $1}')"
+
+  local started_at ended_at rc=0 timed_out=0
+  local marker="$run_dir/timeout.marker"
+  started_at="$(utc_now)"
+  RUN_STARTED_AT="$started_at"
+
+  # One pi call: fixed cwd, reset env, pinned flags, per-call timeout.
+  local flag_args=()
+  while IFS= read -r f; do flag_args+=("$f"); done < <(eval_pi_flags "$model_spec" "$sessions_dir")
+  RUN_FLAG_ARGS=("${flag_args[@]}")
+  (
+    cd "$EVAL_WORKDIR"
+    # shellcheck disable=SC2046  # intentional splitting into repeated -u NAME args
+    exec env $(printf -- '-u %s ' "${EVAL_ENV_RESET[@]}") \
+      "$EVALS_PI_BIN" "${flag_args[@]}" "$prompt" </dev/null
+  ) >"$run_dir/pi.log" 2>&1 &
+  EVAL_RUN_PID=$!
+  # The watcher must not inherit the caller's stdout: its sleep child can
+  # outlive the killed subshell, and an orphan holding a command-substitution
+  # pipe open would block the caller for the whole timeout.
+  (
+    sleep "$timeout_sec"
+    if kill -0 "$EVAL_RUN_PID" 2>/dev/null; then
+      : >"$marker"
+      kill -TERM "$EVAL_RUN_PID" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$EVAL_RUN_PID" 2>/dev/null || true
+    fi
+  ) >/dev/null 2>&1 &
+  local watcher=$!
+  wait "$EVAL_RUN_PID" || rc=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  EVAL_RUN_PID=""
+  if [ -e "$marker" ]; then timed_out=1; fi
+  ended_at="$(utc_now)"
+  RUN_RC="$rc"
+  RUN_TIMED_OUT="$timed_out"
+  RUN_ENDED_AT="$ended_at"
+
+  # Harvest the session: a suite run must produce exactly one JSONL.
+  local sess="" jsonl_count=0 jsonl_valid=0
+  jsonl_count=$(find "$sessions_dir" -maxdepth 1 -name '*.jsonl' -type f | wc -l | tr -d ' ')
+  if [ "$jsonl_count" -eq 1 ]; then
+    sess=$(find "$sessions_dir" -maxdepth 1 -name '*.jsonl' -type f)
+    cp "$sess" "$run_dir/session.jsonl"
+    sess="$run_dir/session.jsonl"
+    if jq -s . "$sess" >/dev/null 2>&1; then jsonl_valid=1; fi
+  fi
+  RUN_SESS="$sess"
+  RUN_JSONL_COUNT="$jsonl_count"
+  RUN_JSONL_VALID="$jsonl_valid"
+
+  # Requested vs actual model (infra gate per spec): every assistant
+  # message and every model_change entry must report exactly the requested
+  # provider/model — a mismatch or a mid-session change is infra-fail.
+  local actual_models="" model_ok=0 thinking_observed="" thinking_ok=1
+  if [ "$jsonl_valid" = 1 ]; then
+    actual_models=$(jq -s -r '
+      [ .[] | select(.type == "message" and .message.role == "assistant")
+        | "\(.message.provider // "")/\(.message.responseModel // .message.model // "")" ]
+      + [ .[] | select(.type == "model_change")
+        | "\(.provider // "")/\(.modelId // "")" ]
+      | unique | .[]' "$sess")
+    if [ "$(printf '%s\n' "$actual_models" | grep -c .)" = 1 ] \
+      && [ "$actual_models" = "$REQ_PROVIDER/$REQ_MODEL" ]; then
+      model_ok=1
+    fi
+    thinking_observed=$(jq -r 'select(.type == "thinking_level_change") | .thinkingLevel' "$sess" 2>/dev/null | tail -n1)
+    if [ -n "$REQ_THINKING" ]; then
+      thinking_ok=0
+      [ "$thinking_observed" = "$REQ_THINKING" ] && thinking_ok=1
+    fi
+  fi
+  RUN_ACTUAL_MODELS="$actual_models"
+  RUN_THINKING_OBSERVED="$thinking_observed"
+
+  # Loaded-resource pinning (infra gate per spec): --no-skills --skill pins
+  # exactly one skill and --no-extensions forbids extension entries, so any
+  # other skill read or any custom entry means the environment leaked
+  # something into the run.
+  local loaded_resources="" res_unexpected="" resources_ok=1
+  if [ "$jsonl_valid" = 1 ]; then
+    loaded_resources="$(grader_loaded_resources "$sess")"
+    res_unexpected="$(unexpected_resources "$loaded_resources" "$EVAL_PINNED_SKILL")"
+    [ -z "$res_unexpected" ] || resources_ok=0
+  fi
+  RUN_LOADED_RESOURCES="$loaded_resources"
+
+  local infra=0
+  [ "$rc" -ne 0 ] && infra=1
+  [ "$timed_out" = 1 ] && infra=1
+  [ "$jsonl_count" -ne 1 ] && infra=1
+  [ "$jsonl_valid" -ne 1 ] && infra=1
+  [ "$model_ok" -ne 1 ] && infra=1
+  [ "$thinking_ok" -ne 1 ] && infra=1
+  [ "$resources_ok" -ne 1 ] && infra=1
+  RUN_INFRA="$infra"
+
+  check_bool "infra: pi exited 0 (exit=$rc)" "$( [ "$rc" -eq 0 ] && echo 1 || echo 0)"
+  check_bool "infra: no timeout within ${timeout_sec}s" "$( [ "$timed_out" = 0 ] && echo 1 || echo 0)"
+  check_bool "infra: exactly one session JSONL (found $jsonl_count)" "$( [ "$jsonl_count" -eq 1 ] && echo 1 || echo 0)"
+  check_bool "infra: session JSONL parses as JSON lines" "$jsonl_valid"
+  check_bool "infra: actual model is $REQ_PROVIDER/$REQ_MODEL (observed: $(printf '%s' "$actual_models" | tr '\n' ' '))" "$model_ok"
+  if [ -n "$REQ_THINKING" ]; then
+    check_bool "infra: thinking level is :$REQ_THINKING (observed: ${thinking_observed:-none})" "$thinking_ok"
+  fi
+  local res_detail="none"
+  [ -n "$res_unexpected" ] && res_detail="$(printf '%s\n' "$res_unexpected" | paste -sd, -)"
+  check_bool "infra: no unexpected loaded resources (unexpected: $res_detail)" "$resources_ok"
+}
+
+# write_usage_json RUN_DIR — usage totals, or the explicit no-JSONL error.
+write_usage_json() {
+  if [ "$RUN_JSONL_VALID" = 1 ]; then
+    grader_usage "$RUN_SESS" >"$1/usage.json"
+  else
+    printf '{"error":"no valid session JSONL"}\n' >"$1/usage.json"
+  fi
+}
+
+# write_run_metadata RUN_DIR SUITE SCENARIO RUN ROLE REQUESTED_SPEC [EXTRA_JSON]
+# — the shared per-run metadata; EXTRA_JSON (a JSON object) merges in
+# suite-specific fields (the baseline adds fingerprint/publication data).
+write_run_metadata() {
+  local run_dir="$1" suite="$2" scenario="$3" run="$4" role="$5" requested="$6"
+  local extra="${7-}"
+  [ -n "$extra" ] || extra='{}'
+  local pi_version git_commit flags_json
+  pi_version="$($EVALS_PI_BIN --version 2>/dev/null | head -n1)"
+  git_commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
+  flags_json=$(printf '%s\n' "${RUN_FLAG_ARGS[@]}" | jq -R . | jq -s .)
+  jq -n \
+    --arg suite "$suite" --arg scenario "$scenario" --argjson run "$run" --arg role "$role" \
+    --arg requestedModel "$requested" --arg provider "$REQ_PROVIDER" --arg model "$REQ_MODEL" \
+    --arg thinkingRequested "$REQ_THINKING" --arg thinkingObserved "$RUN_THINKING_OBSERVED" \
+    --arg actualModels "$(printf '%s\n' "$RUN_ACTUAL_MODELS")" \
+    --argjson timeoutSec "$RUN_TIMEOUT_SEC" --argjson timedOut "$RUN_TIMED_OUT" --argjson exitStatus "$RUN_RC" \
+    --arg pi "$EVALS_PI_BIN" --arg piVersion "$pi_version" --arg gitCommit "$git_commit" \
+    --arg skillSha "$RUN_SKILL_SHA" --arg workdir "$EVAL_WORKDIR" \
+    --argjson loadedResources "$(printf '%s\n' "$RUN_LOADED_RESOURCES" | jq -R -s 'split("\n") | map(select(.!="")) | map(split("\t") | {kind:.[0], name:.[1]})')" \
+    --arg startedAt "$RUN_STARTED_AT" --arg endedAt "$RUN_ENDED_AT" --argjson sessionJsonlCount "$RUN_JSONL_COUNT" \
+    --argjson flags "$flags_json" \
+    --argjson envReset "$(printf '%s\n' "${EVAL_ENV_RESET[@]}" | jq -R . | jq -s .)" \
+    --argjson extra "$extra" \
+    '{suite:$suite, scenario:$scenario, run:$run, role:$role,
+      requestedModel:$requestedModel, provider:$provider, model:$model,
+      thinkingRequested:(if $thinkingRequested=="" then null else $thinkingRequested end),
+      thinkingObserved:(if $thinkingObserved=="" then null else $thinkingObserved end),
+      actualModels:($actualModels|split("\n")|map(select(.!=""))),
+      timeoutSec:$timeoutSec, timedOut:$timedOut, exitStatus:$exitStatus,
+      pi:$pi, piVersion:$piVersion, gitCommit:$gitCommit,
+      skillSha256:$skillSha, workdir:$workdir,
+      loadedResources:$loadedResources,
+      flags:$flags, envReset:$envReset,
+      startedAt:$startedAt, endedAt:$endedAt, sessionJsonlCount:$sessionJsonlCount}
+      + $extra' \
+    >"$run_dir/metadata.json"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,10 +862,6 @@ protocol_run_one() {
   CHECK_FAIL=0
   : >"$CHECKS_FILE"
 
-  local started_at ended_at rc=0 timed_out=0
-  local marker="$run_dir/timeout.marker"
-  started_at="$(utc_now)"
-
   fixture_rebuild
   scenario_seed "$scenario"
   cp "$EVAL_WORKDIR/.2pane/INBOX.md" "$run_dir/seed-INBOX.md"
@@ -651,113 +869,19 @@ protocol_run_one() {
   prompt="$(scenario_prompt "$scenario")"
   printf '%s\n' "$prompt" >"$run_dir/prompt.txt"
   manifest_of "$EVAL_WORKDIR" >"$run_dir/before-manifest.sha256"
-  local skill_sha
-  skill_sha="$($EVAL_SHA256 "$EVAL_WORKDIR/.agents/skills/two-pane-workflow/SKILL.md" | awk '{print $1}')"
 
-  # One pi call: fixed cwd, reset env, pinned flags, per-call timeout.
-  local flag_args=()
-  while IFS= read -r f; do flag_args+=("$f"); done < <(eval_pi_flags "$main_spec" "$sessions_dir")
-  (
-    cd "$EVAL_WORKDIR"
-    # shellcheck disable=SC2046  # intentional splitting into repeated -u NAME args
-    exec env $(printf -- '-u %s ' "${EVAL_ENV_RESET[@]}") \
-      "$EVALS_PI_BIN" "${flag_args[@]}" "$prompt" </dev/null
-  ) >"$run_dir/pi.log" 2>&1 &
-  EVAL_RUN_PID=$!
-  # The watcher must not inherit the caller's stdout: its sleep child can
-  # outlive the killed subshell, and an orphan holding a command-substitution
-  # pipe open would block the caller for the whole timeout.
-  (
-    sleep "$timeout_sec"
-    if kill -0 "$EVAL_RUN_PID" 2>/dev/null; then
-      : >"$marker"
-      kill -TERM "$EVAL_RUN_PID" 2>/dev/null || true
-      sleep 5
-      kill -KILL "$EVAL_RUN_PID" 2>/dev/null || true
-    fi
-  ) >/dev/null 2>&1 &
-  local watcher=$!
-  wait "$EVAL_RUN_PID" || rc=$?
-  kill "$watcher" 2>/dev/null || true
-  wait "$watcher" 2>/dev/null || true
-  EVAL_RUN_PID=""
-  if [ -e "$marker" ]; then timed_out=1; fi
-  ended_at="$(utc_now)"
-
-  # Harvest the session: protocol must produce exactly one JSONL.
-  local sess="" jsonl_count=0 jsonl_valid=0
-  jsonl_count=$(find "$sessions_dir" -maxdepth 1 -name '*.jsonl' -type f | wc -l | tr -d ' ')
-  if [ "$jsonl_count" -eq 1 ]; then
-    sess=$(find "$sessions_dir" -maxdepth 1 -name '*.jsonl' -type f)
-    cp "$sess" "$run_dir/session.jsonl"
-    sess="$run_dir/session.jsonl"
-    if jq -s . "$sess" >/dev/null 2>&1; then jsonl_valid=1; fi
-  fi
-
-  # Requested vs actual model (infra gate per spec): every assistant
-  # message and every model_change entry must report exactly the requested
-  # provider/model — a mismatch or a mid-session change is infra-fail.
-  local actual_models="" model_ok=0 thinking_observed="" thinking_ok=1
-  if [ "$jsonl_valid" = 1 ]; then
-    actual_models=$(jq -s -r '
-      [ .[] | select(.type == "message" and .message.role == "assistant")
-        | "\(.message.provider // "")/\(.message.responseModel // .message.model // "")" ]
-      + [ .[] | select(.type == "model_change")
-        | "\(.provider // "")/\(.modelId // "")" ]
-      | unique | .[]' "$sess")
-    if [ "$(printf '%s\n' "$actual_models" | grep -c .)" = 1 ] \
-      && [ "$actual_models" = "$REQ_PROVIDER/$REQ_MODEL" ]; then
-      model_ok=1
-    fi
-    thinking_observed=$(jq -r 'select(.type == "thinking_level_change") | .thinkingLevel' "$sess" 2>/dev/null | tail -n1)
-    if [ -n "$REQ_THINKING" ]; then
-      thinking_ok=0
-      [ "$thinking_observed" = "$REQ_THINKING" ] && thinking_ok=1
-    fi
-  fi
-
-  # Loaded-resource pinning (infra gate per spec): --no-skills --skill pins
-  # exactly one skill and --no-extensions forbids extension entries, so any
-  # other skill read or any custom entry means the environment leaked
-  # something into the run.
-  local loaded_resources="" res_unexpected="" resources_ok=1
-  if [ "$jsonl_valid" = 1 ]; then
-    loaded_resources="$(grader_loaded_resources "$sess")"
-    res_unexpected="$(unexpected_resources "$loaded_resources" "$EVAL_PINNED_SKILL")"
-    [ -z "$res_unexpected" ] || resources_ok=0
-  fi
-
-  local infra=0
-  [ "$rc" -ne 0 ] && infra=1
-  [ "$timed_out" = 1 ] && infra=1
-  [ "$jsonl_count" -ne 1 ] && infra=1
-  [ "$jsonl_valid" -ne 1 ] && infra=1
-  [ "$model_ok" -ne 1 ] && infra=1
-  [ "$thinking_ok" -ne 1 ] && infra=1
-  [ "$resources_ok" -ne 1 ] && infra=1
-
-  check_bool "infra: pi exited 0 (exit=$rc)" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-  check_bool "infra: no timeout within ${timeout_sec}s" "$([ "$timed_out" = 0 ] && echo 1 || echo 0)"
-  check_bool "infra: exactly one session JSONL (found $jsonl_count)" "$([ "$jsonl_count" -eq 1 ] && echo 1 || echo 0)"
-  check_bool "infra: session JSONL parses as JSON lines" "$jsonl_valid"
-  check_bool "infra: actual model is $REQ_PROVIDER/$REQ_MODEL (observed: $(printf '%s' "$actual_models" | tr '\n' ' '))" "$model_ok"
-  if [ -n "$REQ_THINKING" ]; then
-    check_bool "infra: thinking level is :$REQ_THINKING (observed: ${thinking_observed:-none})" "$thinking_ok"
-  fi
-  local res_detail="none"
-  [ -n "$res_unexpected" ] && res_detail="$(printf '%s\n' "$res_unexpected" | paste -sd, -)"
-  check_bool "infra: no unexpected loaded resources (unexpected: $res_detail)" "$resources_ok"
+  run_pi_once "$run_dir" "$sessions_dir" "$main_spec" "$prompt" "$timeout_sec"
 
   manifest_of "$EVAL_WORKDIR" >"$run_dir/after-manifest.sha256"
 
-  if [ "$infra" = 1 ]; then
+  if [ "$RUN_INFRA" = 1 ]; then
     check_note "# protocol checks skipped: infrastructure failure"
   else
-    scenario_checks "$scenario" "$run_dir" "$sess"
+    scenario_checks "$scenario" "$run_dir" "$RUN_SESS"
   fi
 
   local status
-  if [ "$infra" = 1 ]; then
+  if [ "$RUN_INFRA" = 1 ]; then
     status="infra-fail"
   elif [ "$CHECK_FAIL" -gt 0 ]; then
     status="protocol-fail"
@@ -767,39 +891,8 @@ protocol_run_one() {
   printf '# classification: %s\n' "$status" >>"$CHECKS_FILE"
 
   # Artifacts: usage, metadata.
-  if [ "$jsonl_valid" = 1 ]; then
-    grader_usage "$sess" >"$run_dir/usage.json"
-  else
-    printf '{"error":"no valid session JSONL"}\n' >"$run_dir/usage.json"
-  fi
-  local pi_version git_commit flags_json
-  pi_version="$($EVALS_PI_BIN --version 2>/dev/null | head -n1)"
-  git_commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
-  flags_json=$(printf '%s\n' "${flag_args[@]}" | jq -R . | jq -s .)
-  jq -n \
-    --arg suite protocol --arg scenario "$scenario" --argjson run "$k" --arg role main \
-    --arg requestedModel "$main_spec" --arg provider "$REQ_PROVIDER" --arg model "$REQ_MODEL" \
-    --arg thinkingRequested "$REQ_THINKING" --arg thinkingObserved "$thinking_observed" \
-    --arg actualModels "$(printf '%s\n' "$actual_models")" \
-    --argjson timeoutSec "$timeout_sec" --argjson timedOut "$timed_out" --argjson exitStatus "$rc" \
-    --arg pi "$EVALS_PI_BIN" --arg piVersion "$pi_version" --arg gitCommit "$git_commit" \
-    --arg skillSha "$skill_sha" --arg workdir "$EVAL_WORKDIR" \
-    --argjson loadedResources "$(printf '%s\n' "$loaded_resources" | jq -R -s 'split("\n") | map(select(.!="")) | map(split("\t") | {kind:.[0], name:.[1]})')" \
-    --arg startedAt "$started_at" --arg endedAt "$ended_at" --argjson sessionJsonlCount "$jsonl_count" \
-    --argjson flags "$flags_json" \
-    --argjson envReset "$(printf '%s\n' "${EVAL_ENV_RESET[@]}" | jq -R . | jq -s .)" \
-    '{suite:$suite, scenario:$scenario, run:$run, role:$role,
-      requestedModel:$requestedModel, provider:$provider, model:$model,
-      thinkingRequested:(if $thinkingRequested=="" then null else $thinkingRequested end),
-      thinkingObserved:(if $thinkingObserved=="" then null else $thinkingObserved end),
-      actualModels:($actualModels|split("\n")|map(select(.!=""))),
-      timeoutSec:$timeoutSec, timedOut:$timedOut, exitStatus:$exitStatus,
-      pi:$pi, piVersion:$piVersion, gitCommit:$gitCommit,
-      skillSha256:$skillSha, workdir:$workdir,
-      loadedResources:$loadedResources,
-      flags:$flags, envReset:$envReset,
-      startedAt:$startedAt, endedAt:$endedAt, sessionJsonlCount:$sessionJsonlCount}' \
-    >"$run_dir/metadata.json"
+  write_usage_json "$run_dir"
+  write_run_metadata "$run_dir" protocol "$scenario" "$k" main "$main_spec" '{}'
 
   local total ok_n
   ok_n=$(grep -c '^ok - ' "$CHECKS_FILE" || true)
@@ -807,7 +900,7 @@ protocol_run_one() {
   jq -cn --arg scenario "$scenario" --argjson run "$k" --arg status "$status" \
     --argjson passed "$ok_n" --argjson failed "$CHECK_FAIL" \
     --argjson total "$total" \
-    --arg requestedModel "$main_spec" --arg actualModels "$(printf '%s' "$actual_models" | tr '\n' ' ')" \
+    --arg requestedModel "$main_spec" --arg actualModels "$(printf '%s' "$RUN_ACTUAL_MODELS" | tr '\n' ' ')" \
     '{scenario:$scenario, run:$run, status:$status, passed:$passed, failed:$failed, total:$total,
       requestedModel:$requestedModel, actualModels:($actualModels|split(" ")|map(select(.!="")))}' \
     >>"$run_root/.runs.ndjson"
@@ -921,6 +1014,318 @@ cmd_protocol() {
   } >"$run_root/summary.txt"
   cat "$run_root/summary.txt"
   return "$overall_rc"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Economy task and baseline cache (ticket 05)
+#
+# The baseline is the one expensive direct-Expert reference run: the economy
+# fixture (helper + exactly the two reviewed docs), one Expert-only pi session
+# with the "you are the only agent" mode instruction before the verbatim task,
+# graded by the answer-correctness gate shared with E1 plus the no-bypass
+# checks. It is published into evals/baselines/<fingerprint>/<baseline-id>/
+# only after every gate passes, and reused without model calls while the
+# fingerprint matches. The fingerprint deliberately excludes the Main model
+# (any cheap Main can reuse an Expert baseline) and the raw git commit (only
+# fixture content, via the manifest, invalidates).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ECON_TASK_ID="econ-docs-os-lock"
+ECON_ASSERT_VERSION="v1"            # bump when TASK_TEXT or its assertions change
+EVAL_BASELINE_FORMAT_VERSION="1"    # bump when the baseline artifact layout changes
+
+# Verbatim test data from the spec — do not rephrase.
+ECON_TASK_TEXT='Review docs/spec.md and docs/adr/0001-single-slot-inbox.md. Decide whether the
+workflow needs OS file locking around its inbox when the human guarantees one
+writer at a time. Do not modify files. End your answer with exactly these two
+lines:
+
+decision: no-os-lock
+invariant: human-single-writer'
+ECON_BASELINE_MODE='You are the only agent for this run. Complete the following task yourself and do not use the two-pane inbox.'
+ECON_FINAL_LINE1='decision: no-os-lock'
+ECON_FINAL_LINE2='invariant: human-single-writer'
+
+econ_task_text() { printf '%s\n' "$ECON_TASK_TEXT"; }
+
+# The mode instruction sits before the task block and never changes the task.
+econ_baseline_prompt() { printf '%s\n\n%s\n' "$ECON_BASELINE_MODE" "$ECON_TASK_TEXT"; }
+
+# pinned_env_digest MODEL_SPEC — sha over everything pinned about the run
+# environment: the exact pi flags (the per-run session-dir normalized to a
+# placeholder), the allowed tool list, and the content hash of every allowed
+# resource (the one pinned skill).
+pinned_env_digest() {
+  {
+    eval_pi_flags "$1" "<session-dir>"
+    printf 'tools:%s\n' "bash,read"
+    printf 'skill-sha256:%s\n' \
+      "$($EVAL_SHA256 "$EVAL_WORKDIR/.agents/skills/$EVAL_PINNED_SKILL/SKILL.md" | awk '{print $1}')"
+  } | $EVAL_SHA256 | awk '{print $1}'
+}
+
+# baseline_fingerprint_preimage EXPERT_SPEC PI_VERSION PROMPT_SHA MANIFEST_SHA
+#   PINNED_ENV_SHA — the canonical, line-stable component list the fingerprint
+# hashes. The label set is pinned by self-tests; there is deliberately no
+# main-model and no git-commit component.
+baseline_fingerprint_preimage() {
+  printf 'eval-task:%s:%s\nformat:%s\nexpert-model:%s\npi-version:%s\nprompt-sha256:%s\nfixture-manifest-sha256:%s\npinned-env-sha256:%s\n' \
+    "$ECON_TASK_ID" "$ECON_ASSERT_VERSION" "$EVAL_BASELINE_FORMAT_VERSION" \
+    "$1" "$2" "$3" "$4" "$5"
+}
+
+# baseline_fingerprint ...same args — sha256 of the preimage; doubles as the
+# baseline store directory name.
+baseline_fingerprint() {
+  baseline_fingerprint_preimage "$@" | $EVAL_SHA256 | awk '{print $1}'
+}
+
+# baseline_active_id FP_DIR — print the active baseline id iff the marker
+# exists and points at a complete stored baseline; exit 1 otherwise (missing
+# marker, dangling pointer, tampered id, incomplete artifacts).
+baseline_active_id() {
+  local dir="$1" id f
+  id="$(cat "$dir/active" 2>/dev/null)" || return 1
+  [ -n "$id" ] || return 1
+  case "$id" in
+    ''|*[!A-Za-z0-9._-]*|.*|*/*) return 1 ;;
+  esac
+  for f in session.jsonl answer.txt prompt.txt metadata.json usage.json checks.txt fixture-manifest.sha256; do
+    [ -s "$dir/$id/$f" ] || return 1
+  done
+  printf '%s\n' "$id"
+}
+
+# baseline_publish FP_DIR ID RUN_DIR — copy the graded artifacts under an
+# immutable id and atomically repoint the active marker (write temp + rename
+# in the same directory). Existing baselines are never modified or deleted.
+baseline_publish() {
+  local fp_dir="$1" id="$2" run_dir="$3"
+  local stage
+  mkdir -p "$fp_dir"
+  stage="$fp_dir/.staging-$$"
+  rm -rf "$stage"
+  mkdir "$stage"
+  cp "$run_dir/session.jsonl" "$run_dir/answer.txt" "$run_dir/prompt.txt" \
+    "$run_dir/metadata.json" "$run_dir/usage.json" "$run_dir/checks.txt" "$stage/"
+  cp "$run_dir/before-manifest.sha256" "$stage/fixture-manifest.sha256"
+  mv "$stage" "$fp_dir/$id"
+  printf '%s\n' "$id" >"$fp_dir/.active.tmp.$$"
+  mv "$fp_dir/.active.tmp.$$" "$fp_dir/active"
+}
+
+# baseline_checks RUN_DIR SESS — Expert-only baseline assertions: the answer
+# correctness gate shared with E1 (exact two final lines), the two-pane inbox
+# unused (the run is deliberately single-agent), reads scoped to fixture
+# files, plus the shared no-bypass checks. Infra gates (model pinning, JSONL
+# integrity, resources) already ran in run_pi_once.
+baseline_checks() {
+  local run_dir="$1" sess="$2"
+  local inbox="$EVAL_WORKDIR/.2pane/INBOX.md"
+  local consuming="$EVAL_WORKDIR/.2pane/consuming.md"
+  local v t
+
+  # 1. Final answer ends with exactly the two decision/invariant lines —
+  #    the same correctness assertion E1's Main final answer must pass.
+  v=0
+  if t="$(grader_final_text "$sess")"; then
+    [ "$(printf '%s\n' "$t" | tail -n 2)" = "$ECON_FINAL_LINE1
+$ECON_FINAL_LINE2" ] && v=1
+  fi
+  check_bool "baseline: final answer ends with the exact two lines '$ECON_FINAL_LINE1' / '$ECON_FINAL_LINE2'" "$v"
+
+  # 2. Two-pane inbox unused: no helper invocation at all, inbox still empty,
+  #    no leftover consume state.
+  v=0
+  if [ -z "$(grader_helper_calls "$sess")" ] && [ -f "$inbox" ] \
+    && [ ! -s "$inbox" ] && [ ! -e "$consuming" ]; then
+    v=1
+  fi
+  check_bool "baseline: two-pane inbox unused (no ./2pane calls, inbox empty, no consuming.md)" "$v"
+
+  # 3. read only on fixture files (the two docs, the skill).
+  v=0
+  [ -z "$(grader_reads_outside_fixture "$sess")" ] && v=1
+  check_bool "baseline: read tool used only for fixture files" "$v"
+
+  # Shared: forbidden direct runtime access, the economy bash rule (bash is
+  # for the helper only — and the helper is forbidden here, so zero bash),
+  # and the untouched fixture manifest.
+  protocol_checks_common baseline "$run_dir" "$sess"
+}
+
+# cmd_baseline --expert-model SPEC [--timeout SEC] [--refresh-baseline] —
+# create or reuse the persistent Expert-only baseline. Fingerprint first: a
+# valid active baseline short-circuits before any model call; a fresh run is
+# published (immutable id, atomic active repoint) only after every gate
+# passes. A failed attempt stays in results and never becomes active.
+cmd_baseline() {
+  local expert_spec="" timeout_sec=$EVAL_DEFAULT_TIMEOUT refresh=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --expert-model)
+        [ "$#" -ge 2 ] || eval_die "--expert-model requires a value"
+        expert_spec="$2"; shift 2 ;;
+      --timeout)
+        [ "$#" -ge 2 ] || eval_die "--timeout requires a value"
+        timeout_sec="$2"; shift 2 ;;
+      --refresh-baseline) refresh=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) eval_die "unknown baseline option: $1" ;;
+    esac
+  done
+  [ -n "$expert_spec" ] || eval_die "baseline requires --expert-model SPEC (provider/model[:thinking])"
+  parse_model_spec "$expert_spec"
+  case "$timeout_sec" in ''|*[!0-9]*|0) eval_die "--timeout must be a positive integer (seconds)" ;; esac
+  command -v jq >/dev/null 2>&1 || eval_die "jq is required"
+  [ -f "$REPO_ROOT/docs/spec.md" ] && [ -f "$REPO_ROOT/docs/adr/0001-single-slot-inbox.md" ] \
+    || eval_die "economy fixture requires docs/spec.md and docs/adr/0001-single-slot-inbox.md in the checkout"
+
+  local stamp run_root run_dir sessions_dir
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  run_root="$EVAL_RESULTS_DIR/$stamp"
+  run_dir="$run_root/baseline-r1"
+  sessions_dir="$run_dir/sessions"
+
+  trap eval_cleanup EXIT
+  trap 'exit 130' INT TERM
+  lock_acquire || exit 4
+  mkdir -p "$sessions_dir"
+
+  # Rebuild the pristine economy fixture, then hash every fingerprint
+  # component from it (prompt bytes, manifest, pinned environment).
+  fixture_rebuild_economy
+  local prompt prompt_sha pi_version manifest_sha pinned_env fp
+  prompt="$(econ_baseline_prompt)"
+  printf '%s\n' "$prompt" >"$run_dir/prompt.txt"
+  manifest_of "$EVAL_WORKDIR" >"$run_dir/before-manifest.sha256"
+  prompt_sha="$($EVAL_SHA256 "$run_dir/prompt.txt" | awk '{print $1}')"
+  pi_version="$($EVALS_PI_BIN --version 2>/dev/null | head -n1)"
+  manifest_sha="$($EVAL_SHA256 "$run_dir/before-manifest.sha256" | awk '{print $1}')"
+  pinned_env="$(pinned_env_digest "$expert_spec")"
+  fp="$(baseline_fingerprint "$expert_spec" "$pi_version" "$prompt_sha" "$manifest_sha" "$pinned_env")"
+
+  local active_id=""
+  if [ "$refresh" != 1 ] && active_id="$(baseline_active_id "$EVAL_BASELINES_DIR/$fp")"; then
+    local active_dir="$EVAL_BASELINES_DIR/$fp/$active_id"
+    printf 'evals: baseline active: %s\n' "$active_id"
+    printf 'evals: baseline store: %s\n' "$active_dir"
+    printf 'evals: fingerprint: %s\n' "$fp"
+    # Baselines never expire silently: the report always shows when the cached
+    # run was made and what it cost, so a stale reference is visible.
+    printf 'evals: created: %s\n' "$(jq -r .createdAt "$active_dir/metadata.json" 2>/dev/null || printf unknown)"
+    printf 'evals: expert tokens: %s\n' "$(jq -r .totalTokens "$active_dir/usage.json" 2>/dev/null || printf unknown)"
+    printf 'evals: reused without a model call (--refresh-baseline forces a new run)\n'
+    rm -rf "$run_root"
+    lock_release
+    return 0
+  fi
+
+  CHECKS_FILE="$run_dir/checks.txt"
+  CHECK_FAIL=0
+  : >"$CHECKS_FILE"
+
+  run_pi_once "$run_dir" "$sessions_dir" "$expert_spec" "$prompt" "$timeout_sec"
+
+  manifest_of "$EVAL_WORKDIR" >"$run_dir/after-manifest.sha256"
+
+  if [ "$RUN_INFRA" = 1 ]; then
+    check_note "# baseline checks skipped: infrastructure failure"
+  else
+    baseline_checks "$run_dir" "$RUN_SESS"
+  fi
+
+  local status
+  if [ "$RUN_INFRA" = 1 ]; then
+    status="infra-fail"
+  elif [ "$CHECK_FAIL" -gt 0 ]; then
+    status="protocol-fail"
+  else
+    status="pass"
+  fi
+  printf '# classification: %s\n' "$status" >>"$CHECKS_FILE"
+
+  # Artifacts: usage, final answer (when one exists), metadata with the
+  # fingerprint components and publication state.
+  write_usage_json "$run_dir"
+  local answer_ok=0
+  if grader_final_text "$RUN_SESS" >"$run_dir/answer.txt" 2>/dev/null; then
+    answer_ok=1
+  else
+    rm -f "$run_dir/answer.txt"
+  fi
+
+  local published=false
+  if [ "$status" = pass ] && [ "$answer_ok" = 1 ]; then
+    published=true
+  fi
+
+  local baseline_id session_sha extra
+  baseline_id="bl-$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -tx4 -N4 /dev/urandom | tr -d ' \n')"
+  session_sha=""
+  if [ -n "$RUN_SESS" ]; then
+    session_sha="$($EVAL_SHA256 "$RUN_SESS" | awk '{print $1}')"
+  fi
+  extra="$(jq -cn \
+    --arg fingerprint "$fp" --arg evalTask "$ECON_TASK_ID:$ECON_ASSERT_VERSION" \
+    --arg formatVersion "$EVAL_BASELINE_FORMAT_VERSION" --arg expertModel "$expert_spec" \
+    --arg piVersion "$pi_version" --arg promptSha256 "$prompt_sha" \
+    --arg fixtureManifestSha256 "$manifest_sha" --arg pinnedEnvSha256 "$pinned_env" \
+    --arg baselineId "$baseline_id" --arg sessionSha256 "$session_sha" \
+    --argjson published "$published" --arg createdAt "$(utc_now)" \
+    '{fingerprint:$fingerprint,
+      fingerprintComponents:{evalTask:$evalTask, formatVersion:$formatVersion,
+        expertModel:$expertModel, piVersion:$piVersion, promptSha256:$promptSha256,
+        fixtureManifestSha256:$fixtureManifestSha256, pinnedEnvSha256:$pinnedEnvSha256},
+      baselineId:$baselineId, sessionSha256:$sessionSha256, published:$published,
+      createdAt:$createdAt}')"
+  write_run_metadata "$run_dir" baseline baseline 1 expert "$expert_spec" "$extra"
+
+  if [ "$published" = true ]; then
+    baseline_publish "$EVAL_BASELINES_DIR/$fp" "$baseline_id" "$run_dir"
+  fi
+
+  local ok_n total
+  ok_n=$(grep -c '^ok - ' "$CHECKS_FILE" || true)
+  total=$((ok_n + CHECK_FAIL))
+  jq -n --arg overall "$status" --arg fingerprint "$fp" --arg baselineId "$baseline_id" \
+    --argjson published "$published" --arg requestedModel "$expert_spec" \
+    --argjson usage "$(cat "$run_dir/usage.json")" \
+    '{suite:"baseline", overall:$overall, fingerprint:$fingerprint,
+      baselineId:(if $published then $baselineId else null end),
+      published:$published, requestedModel:$requestedModel, usage:$usage}' \
+    >"$run_root/summary.json"
+  {
+    printf 'baseline summary %s\n' "$stamp"
+    printf 'requested expert-model: %s\n' "$expert_spec"
+    printf 'status: %s\n' "$status"
+    printf 'fingerprint: %s\n' "$fp"
+    if [ "$published" = true ]; then
+      printf 'baseline: %s\n' "$baseline_id"
+    else
+      printf 'baseline: not published (%s)\n' "$status"
+    fi
+    jq -r '"expert tokens: \(.usage.totalTokens // 0)  expert cost: \(.usage.cost.total // 0)"' \
+      "$run_root/summary.json"
+  } >"$run_root/summary.txt"
+
+  printf 'evals: run root: %s\n' "$run_root"
+  cat "$CHECKS_FILE"
+  printf 'evals: baseline: %s (%s ok, %s not ok)\n' "$status" "$ok_n" "$CHECK_FAIL"
+  if [ "$published" = true ]; then
+    printf 'evals: baseline published: %s\n' "$baseline_id"
+    printf 'evals: baseline store: %s\n' "$EVAL_BASELINES_DIR/$fp/$baseline_id"
+  else
+    printf 'evals: baseline not published (%s); the failed attempt stays in results\n' "$status"
+  fi
+  cat "$run_root/summary.txt"
+  lock_release
+
+  case "$status" in
+    pass) return 0 ;;
+    protocol-fail) return 1 ;;
+    *) return 3 ;;
+  esac
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1517,6 +1922,208 @@ STUB
     "$(grep -q 'not ok - infra: no unexpected loaded resources.*sneaky-skill' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
   rm -rf "$run_root"
 
+  # ── economy task + baseline fingerprint + read scope (ticket 05) ──
+  local fp_a env_digest
+  expect_eq "econ: task text ends with the exact two decision lines" \
+    "$(econ_task_text | tail -n 2)" "$ECON_FINAL_LINE1
+$ECON_FINAL_LINE2"
+  expect_eq "econ: baseline prompt is mode instruction + blank line + task" \
+    "$(econ_baseline_prompt)" "$ECON_BASELINE_MODE
+
+$ECON_TASK_TEXT"
+  fp_a="$(baseline_fingerprint openai-codex/gpt-5.6-sol:medium pi-1 psha-1 msha-1 esha-1)"
+  expect_eq "fingerprint: byte-stable across calls" "$fp_a" \
+    "$(baseline_fingerprint openai-codex/gpt-5.6-sol:medium pi-1 psha-1 msha-1 esha-1)"
+  expect_eq "fingerprint: sha256 hex digest" \
+    "$(printf '%s' "$fp_a" | grep -cE '^[0-9a-f]{64}$')" "1"
+  expect_eq "fingerprint: component labels pinned (no main-model, no git commit)" \
+    "$(baseline_fingerprint_preimage x y z w v | cut -d: -f1 | tr '\n' ' ')" \
+    "eval-task format expert-model pi-version prompt-sha256 fixture-manifest-sha256 pinned-env-sha256 "
+  check "fingerprint: changes with the expert model" \
+    "$(if [  "$fp_a" != "$(baseline_fingerprint openai-codex/gpt-5.6-luna:medium pi-1 psha-1 msha-1 esha-1)"  ]; then echo 0; else echo 1; fi)"
+  check "fingerprint: changes with the thinking level" \
+    "$(if [  "$fp_a" != "$(baseline_fingerprint openai-codex/gpt-5.6-sol:high pi-1 psha-1 msha-1 esha-1)"  ]; then echo 0; else echo 1; fi)"
+  check "fingerprint: changes with the pi version" \
+    "$(if [  "$fp_a" != "$(baseline_fingerprint openai-codex/gpt-5.6-sol:medium pi-2 psha-1 msha-1 esha-1)"  ]; then echo 0; else echo 1; fi)"
+  check "fingerprint: changes with the prompt" \
+    "$(if [  "$fp_a" != "$(baseline_fingerprint openai-codex/gpt-5.6-sol:medium pi-1 psha-2 msha-1 esha-1)"  ]; then echo 0; else echo 1; fi)"
+  check "fingerprint: changes with the fixture manifest" \
+    "$(if [  "$fp_a" != "$(baseline_fingerprint openai-codex/gpt-5.6-sol:medium pi-1 psha-1 msha-2 esha-1)"  ]; then echo 0; else echo 1; fi)"
+  check "fingerprint: changes with the pinned environment" \
+    "$(if [  "$fp_a" != "$(baseline_fingerprint openai-codex/gpt-5.6-sol:medium pi-1 psha-1 msha-1 esha-2)"  ]; then echo 0; else echo 1; fi)"
+
+  # F10: read-scope — economy reads may target only fixture files; runtime
+  # state is the forbidden scan's job, absolute-outside and `..` escapes ours.
+  cat >"$TMP/reads.jsonl" <<'EOF'
+{"type":"session","version":3,"timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"r1","name":"read","arguments":{"path":"docs/spec.md"}},{"type":"toolCall","id":"r2","name":"read","arguments":{"path":"/tmp/2pane-workflow-eval-workdir/docs/adr/0001-single-slot-inbox.md"}},{"type":"toolCall","id":"r3","name":"read","arguments":{"path":"/etc/passwd"}},{"type":"toolCall","id":"r4","name":"read","arguments":{"path":"../checkout/docs/spec.md"}},{"type":"toolCall","id":"b1","name":"bash","arguments":{"command":"./2pane take"}}]}}
+EOF
+  expect_eq "reads: fixture docs and workdir-absolute paths pass, escapes flagged" \
+    "$(grader_reads_outside_fixture "$TMP/reads.jsonl")" "/etc/passwd
+../checkout/docs/spec.md"
+  expect_eq "reads: bash calls never look like read paths" \
+    "$(grader_reads_outside_fixture "$TMP/reads.jsonl" | grep -c 2pane || true)" "0"
+
+  # Economy fixture: exactly the two docs beyond the protocol fixture, and
+  # they enter the manifest (so fixture changes invalidate the fingerprint).
+  fixture_rebuild_economy
+  check "econ fixture: exactly the two economy docs copied in" \
+    "$(if [  -f "$EVAL_WORKDIR/docs/spec.md" ] && [ -f "$EVAL_WORKDIR/docs/adr/0001-single-slot-inbox.md" ] && [ "$(find "$EVAL_WORKDIR/docs" -type f | wc -l | tr -d ' ')" = 2 ]; then echo 0; else echo 1; fi)"
+  manifest_of "$EVAL_WORKDIR" >"$TMP/econ-manifest.sha256"
+  check "econ fixture: docs enter the manifest" \
+    "$(grep -q 'docs/spec.md' "$TMP/econ-manifest.sha256"; echo $?)"
+  env_digest="$(pinned_env_digest openai-codex/gpt-5.6-sol)"
+  expect_eq "pinned-env digest: byte-stable" "$env_digest" "$(pinned_env_digest openai-codex/gpt-5.6-sol)"
+  printf 'local edit\n' >>"$EVAL_WORKDIR/.agents/skills/$EVAL_PINNED_SKILL/SKILL.md"
+  check "pinned-env digest: changes with skill content" \
+    "$(if [  "$env_digest" != "$(pinned_env_digest openai-codex/gpt-5.6-sol)"  ]; then echo 0; else echo 1; fi)"
+  check "pinned-env digest: expert spec enters the pinned flags" \
+    "$(if [  "$env_digest" != "$(pinned_env_digest openai-codex/gpt-5.6-luna)"  ]; then echo 0; else echo 1; fi)"
+  fixture_rebuild  # restore a pristine protocol fixture for the blocks below
+
+  # ── baseline command end-to-end with a stub pi (ticket 05) ──
+  cat >"$TMP/pi-baseline" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then printf 'stub-pi 0.0.0\n'; exit 0; fi
+sessdir="" prev=""
+for a in "$@"; do
+  [ "$prev" = "--session-dir" ] && sessdir="$a"
+  prev="$a"
+done
+mode="$(cat "$(dirname "$0")/blmode" 2>/dev/null || printf good)"
+[ "$mode" = crash ] && exit 3
+[ "$mode" = count ] && printf 'called\n' >>"$(dirname "$0")/blcalls"
+final='Both documents assume a single human writer, so OS file locking is unnecessary.\ndecision: no-os-lock\ninvariant: human-single-writer'
+[ "$mode" = bad-answer ] && final='The workflow looks fine as it is.'
+{
+  printf '{"type":"session","version":3,"id":"bl","timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}\n'
+  printf '{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}\n'
+  printf '{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"r1","name":"read","arguments":{"path":"docs/spec.md"}},{"type":"toolCall","id":"r2","name":"read","arguments":{"path":"docs/adr/0001-single-slot-inbox.md"}}],"usage":{"input":1000,"output":100,"totalTokens":1100,"cost":{"total":0.1}}}}\n'
+  printf '{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"r1","toolName":"read","isError":false,"content":[{"type":"text","text":"doc body"}]}}\n'
+  printf '{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-22T00:00:02.100Z","message":{"role":"toolResult","toolCallId":"r2","toolName":"read","isError":false,"content":[{"type":"text","text":"adr body"}]}}\n'
+  printf '{"type":"message","id":"e5","parentId":"e4","timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"stop","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"text","text":"%s"}],"usage":{"input":2000,"output":200,"totalTokens":2200,"cost":{"total":0.2}}}}\n' "$final"
+} >"$sessdir/stub.jsonl"
+printf '%b\n' "$final"
+exit 0
+STUB
+  chmod +x "$TMP/pi-baseline"
+  run_baseline() { # store-dir stub-path extra-args... → sets out/rc/run_root
+    out=""
+    rc=0
+    out=$(EVALS_BASELINE_DIR="$1" EVALS_PI_BIN="$2" bash "${BASH_SOURCE[0]}" baseline \
+      --expert-model openai-codex/gpt-5.6-sol --timeout 30 "${@:3}" 2>&1) || rc=$?
+    run_root=$(printf '%s\n' "$out" | sed -n 's/^evals: run root: //p' | head -n1)
+  }
+
+  # Publish: a compliant Expert-only run lands in the store, complete.
+  local bl_store="$TMP/bl-store" bl_bad="$TMP/bl-bad" bl_crash="$TMP/bl-crash"
+  local fp_dir id1 id2 id3 run_root1
+  printf 'good\n' >"$TMP/blmode"
+  rm -f "$TMP/blcalls"
+  run_baseline "$bl_store" "$TMP/pi-baseline"
+  run_root1="$run_root"
+  check "baseline/good: run passes and publishes (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  check "baseline/good: classification is pass" \
+    "$(grep -q '^# classification: pass$' "$run_root1/baseline-r1/checks.txt" 2>/dev/null; echo $?)"
+  fp_dir="$(find "$bl_store" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  id1="$(cat "$fp_dir/active" 2>/dev/null)" || true
+  check "baseline/good: active marker points at the published id" \
+    "$(if [  -n "$id1"  ] && [ -d "$fp_dir/$id1" ]; then echo 0; else echo 1; fi)"
+  check "baseline/good: published artifact set complete" \
+    "$(for f in session.jsonl answer.txt prompt.txt metadata.json usage.json checks.txt fixture-manifest.sha256; do
+         [ -s "$fp_dir/$id1/$f" ] || exit 1
+       done; echo $?)"
+  check "baseline/good: store dir name equals the fingerprint" \
+    "$(if [  "$(basename "$fp_dir")" = "$(jq -r .fingerprint "$fp_dir/$id1/metadata.json" 2>/dev/null)" ]; then echo 0; else echo 1; fi)"
+  check "baseline/good: metadata pins suite/role/expert/fingerprint/publication" \
+    "$(jq -e '.suite=="baseline" and .role=="expert" and .scenario=="baseline"
+        and .requestedModel=="openai-codex/gpt-5.6-sol" and .published==true
+        and .baselineId!=null and .fingerprintComponents.expertModel=="openai-codex/gpt-5.6-sol"
+        and (.fingerprintComponents|has("piVersion") and has("promptSha256") and has("fixtureManifestSha256") and has("pinnedEnvSha256"))
+        and (.sessionSha256|length==64)' "$fp_dir/$id1/metadata.json" >/dev/null 2>&1; echo $?)"
+  expect_eq "baseline/good: usage totals summed from the session" \
+    "$(jq -c '{input,output,totalTokens}' "$fp_dir/$id1/usage.json" 2>/dev/null)" \
+    '{"input":3000,"output":300,"totalTokens":3300}'
+  expect_eq "baseline/good: answer ends with the exact two lines" \
+    "$(tail -n 2 "$fp_dir/$id1/answer.txt" 2>/dev/null)" "$ECON_FINAL_LINE1
+$ECON_FINAL_LINE2"
+  check "baseline/good: prompt.txt is mode instruction + task" \
+    "$(if [  "$(head -n1 "$fp_dir/$id1/prompt.txt" 2>/dev/null)" = "$ECON_BASELINE_MODE" ] && grep -qF 'Review docs/spec.md and docs/adr/0001-single-slot-inbox.md.' "$fp_dir/$id1/prompt.txt" 2>/dev/null; then echo 0; else echo 1; fi)"
+  check "baseline/good: inbox-unused and read-scope checks recorded" \
+    "$(grep -q '^ok - baseline: two-pane inbox unused' "$run_root1/baseline-r1/checks.txt" 2>/dev/null \
+       && grep -q '^ok - baseline: read tool used only for fixture files' "$run_root1/baseline-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "baseline/good: results copy also kept" \
+    "$(if [  -s "$run_root1/baseline-r1/session.jsonl" ]; then echo 0; else echo 1; fi)"
+
+  # Reuse: matching fingerprint → same id printed, zero pi invocations.
+  printf 'count\n' >"$TMP/blmode"
+  rm -f "$TMP/blcalls"
+  run_baseline "$bl_store" "$TMP/pi-baseline"
+  check "baseline/cache: reuse exits 0" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  check "baseline/cache: same active id reprinted" \
+    "$(printf '%s\n' "$out" | grep -q "^evals: baseline active: $id1$"; echo $?)"
+  check "baseline/cache: no model call made" "$(if [  ! -e "$TMP/blcalls" ]; then echo 0; else echo 1; fi)"
+  check "baseline/cache: no run dir created" \
+    "$(if [  -z "$run_root" ] || [ ! -e "$run_root" ]; then echo 0; else echo 1; fi)"
+
+  # The two stores are independent: deleting results leaves baselines intact.
+  rm -rf "$run_root1"
+  run_baseline "$bl_store" "$TMP/pi-baseline"
+  check "baseline/cache: store independent of results deletion" \
+    "$(if [  "$rc" -eq 0  ] && [ "$(cat "$bl_store/$(basename "$fp_dir")/active" 2>/dev/null)" = "$id1" ] && [ ! -e "$TMP/blcalls" ]; then echo 0; else echo 1; fi)"
+
+  # Refresh: new immutable id, active repointed atomically, old kept intact.
+  printf 'good\n' >"$TMP/blmode"
+  run_baseline "$bl_store" "$TMP/pi-baseline" --refresh-baseline
+  check "baseline/refresh: fresh run publishes (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  id2="$(cat "$fp_dir/active" 2>/dev/null)" || true
+  check "baseline/refresh: active repointed to a new immutable id" \
+    "$(if [  -n "$id2" ] && [ "$id2" != "$id1" ] && [ -d "$fp_dir/$id2" ]; then echo 0; else echo 1; fi)"
+  check "baseline/refresh: previous baseline preserved intact" \
+    "$(for f in session.jsonl answer.txt prompt.txt metadata.json usage.json checks.txt fixture-manifest.sha256; do
+         [ -s "$fp_dir/$id1/$f" ] || exit 1
+       done; echo $?)"
+  check "baseline/refresh: both baselines coexist in the fingerprint dir" \
+    "$(if [  "$(find "$fp_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 2 ]; then echo 0; else echo 1; fi)"
+  rm -rf "$run_root"
+
+  # A wrong answer fails the correctness gate and is never published.
+  printf 'bad-answer\n' >"$TMP/blmode"
+  run_baseline "$bl_bad" "$TMP/pi-baseline"
+  check "baseline/bad-answer: wrong final answer is protocol-fail (rc=$rc)" "$(if [  "$rc" -eq 1  ]; then echo 0; else echo 1; fi)"
+  check "baseline/bad-answer: two-line assertion flagged" \
+    "$(grep -q '^not ok - baseline: final answer ends with the exact two lines' "$run_root/baseline-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "baseline/bad-answer: nothing published" "$(if [  ! -e "$bl_bad" ]; then echo 0; else echo 1; fi)"
+  check "baseline/bad-answer: failed attempt kept in results" \
+    "$(grep -q '^# classification: protocol-fail$' "$run_root/baseline-r1/checks.txt" 2>/dev/null; echo $?)"
+  rm -rf "$run_root"
+
+  # A pi crash is infra-fail and never becomes a baseline.
+  printf 'crash\n' >"$TMP/blmode"
+  run_baseline "$bl_crash" "$TMP/pi-baseline"
+  check "baseline/crash: crash classifies infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
+  check "baseline/crash: store untouched" "$(if [  ! -e "$bl_crash" ]; then echo 0; else echo 1; fi)"
+  check "baseline/crash: lock released" "$(if [  ! -e "$EVAL_LOCKDIR" ]; then echo 0; else echo 1; fi)"
+  rm -rf "$run_root"
+
+  # A stale/dangling active marker is treated as no valid baseline.
+  printf 'bl-00000000T000000Z-deadbeef\n' >"$fp_dir/active"
+  printf 'count\n' >"$TMP/blmode"
+  rm -f "$TMP/blcalls"
+  run_baseline "$bl_store" "$TMP/pi-baseline"
+  id3="$(cat "$fp_dir/active" 2>/dev/null)" || true
+  check "baseline/stale-active: dangling marker triggers a fresh run" \
+    "$(if [  "$rc" -eq 0  ] && [ -n "$id3" ] && [ "$id3" != "bl-00000000T000000Z-deadbeef" ] && [ -e "$TMP/blcalls" ]; then echo 0; else echo 1; fi)"
+  rm -rf "$run_root"
+
+  # Usage errors keep exit 2.
+  rc=0
+  out=$(EVALS_BASELINE_DIR="$bl_store" bash "${BASH_SOURCE[0]}" baseline 2>&1) || rc=$?
+  check "baseline/usage: missing --expert-model is a usage error" "$(if [  "$rc" -eq 2  ]; then echo 0; else echo 1; fi)"
+
+  rm -rf "$bl_store" "$bl_bad" "$bl_crash"
+
   # Lock conflict: a held lock must stop a second runner before any run.
   mkdir -p "$EVAL_LOCKDIR"; printf '99999\n' >"$EVAL_LOCKDIR/pid"
   rc=0
@@ -1542,7 +2149,8 @@ main() {
   case "$1" in
     self-test) shift; self_test "$@" ;;
     protocol) shift; cmd_protocol "$@" ;;
-    baseline|economy)
+    baseline) shift; cmd_baseline "$@" ;;
+    economy)
       printf 'evals: %s suite is not implemented yet\n' "$1" >&2
       exit 2 ;;
     -h|--help) usage ;;
