@@ -35,6 +35,11 @@
 #              fingerprint, session hash, usage snapshot), exploratory marker
 #              on single-sample comparisons, and the full token+money cost
 #              report (Main vs Expert vs baseline, Expert share).
+#   fix 2026-08-22: grader_reads_outside_fixture also accepts the PHYSICAL
+#              (symlink-resolved) spelling of the eval workdir — on macOS
+#              /tmp → /private/tmp, and a model reading the fixture docs via
+#              the canonical path was falsely flagged as reading outside
+#              the fixture (deterministic self-test added).
 #
 # Usage:
 #   evals/run.sh self-test
@@ -318,13 +323,27 @@ grader_usage() {
 # fixture: absolute paths outside the eval workdir, or relative paths with a
 # `..` component. Economy runs may read only the fixture's own files (the two
 # docs, the skill); runtime state is covered separately by the forbidden scan.
+# The workdir also matches by its PHYSICAL path (symlink-resolved): on macOS
+# /tmp is a symlink to /private/tmp, and a model (or tool) reporting the
+# canonical /private/tmp/... spelling of the same fixture file is not an
+# escape. When the workdir does not exist the physical alias is unknown and
+# only the literal spelling matches (an empty alias must match nothing).
 grader_reads_outside_fixture() {
+  local wdphys=""
+  [ -d "$EVAL_WORKDIR" ] && wdphys="$(cd "$EVAL_WORKDIR" && pwd -P)"
   jq -r -s '
     [.[] | select(.type=="message" and .message.role=="assistant")
       | .message.content[]? | select(.type=="toolCall" and .name=="read")
       | (.arguments.path // empty)] | .[]' "$1" | while IFS= read -r p; do
       case "$p" in
-        "$EVAL_WORKDIR"/*) ;;
+        "$EVAL_WORKDIR"/*) continue ;;
+      esac
+      if [ -n "$wdphys" ]; then
+        case "$p" in
+          "$wdphys"/*) continue ;;
+        esac
+      fi
+      case "$p" in
         /*) printf '%s\n' "$p" ;;
         ../*|*/../*|*/..|..) printf '%s\n' "$p" ;;
       esac
@@ -2610,6 +2629,31 @@ EOF
 ../checkout/docs/spec.md"
   expect_eq "reads: bash calls never look like read paths" \
     "$(grader_reads_outside_fixture "$TMP/reads.jsonl" | grep -c 2pane || true)" "0"
+
+  # F10b: symlink-aliased workdir — a read reported through the PHYSICAL
+  # spelling of the same fixture directory (macOS: /tmp → /private/tmp,
+  # /var → /private/var) is not an escape. Deterministic on any platform:
+  # our own symlink provides the two spellings, and pwd -P gives the truly
+  # physical one — the exact string a model resolving real paths emits.
+  mkdir -p "$TMP/rd-real/docs"
+  ln -sfn "$TMP/rd-real" "$TMP/rd-link"
+  local rd_phys saved_wd="$EVAL_WORKDIR"
+  rd_phys="$(cd "$TMP/rd-link" && pwd -P)"
+  cat >"$TMP/reads-alias.jsonl" <<EOF
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"r1","name":"read","arguments":{"path":"$TMP/rd-link/docs/spec.md"}},{"type":"toolCall","id":"r2","name":"read","arguments":{"path":"$rd_phys/docs/spec.md"}},{"type":"toolCall","id":"r3","name":"read","arguments":{"path":"$rd_phys-OTHER/docs/spec.md"}}]}}
+EOF
+  EVAL_WORKDIR="$TMP/rd-link"
+  expect_eq "reads: literal and physical spellings of the workdir both pass" \
+    "$(grader_reads_outside_fixture "$TMP/reads-alias.jsonl")" \
+    "$rd_phys-OTHER/docs/spec.md"
+  EVAL_WORKDIR="$TMP/rd-nonexistent"
+  expect_eq "reads: missing workdir falls back to the literal spelling only" \
+    "$(grader_reads_outside_fixture "$TMP/reads-alias.jsonl")" \
+    "$TMP/rd-link/docs/spec.md
+$rd_phys/docs/spec.md
+$rd_phys-OTHER/docs/spec.md"
+  EVAL_WORKDIR="$saved_wd"
+  rm -rf "$TMP/rd-real" "$TMP/rd-link"
 
   # Economy fixture: exactly the two docs beyond the protocol fixture, and
   # they enter the manifest (so fixture changes invalidate the fingerprint).
