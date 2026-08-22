@@ -6,8 +6,11 @@
 #              calls); every later suite builds on these helpers.
 #   ticket 02: protocol harness — fixture rebuild in a fixed workdir, lock,
 #              env reset, pinned pi flags, per-call timeout with trap cleanup,
-#              full artifact set, and scenario S1 (send-empty) graded end to
-#              end against a real pi run. S2–S4 arrive with ticket 03.
+#              full artifact set, and a first end-to-end graded run.
+#   ticket 03: full protocol suite — S1–S4 as data plus a checks function in
+#              the scenario registry, --runs N with per-run fresh fixtures,
+#              and summary.json/summary.txt grouped by actual Main-model
+#              with protocol/infra failures per scenario.
 #
 # Usage:
 #   evals/run.sh self-test
@@ -27,8 +30,11 @@ Commands:
   self-test                      Run grader self-tests on synthetic JSONL
                                  fixtures plus zero-model-call harness tests
                                  (stub pi via EVALS_PI_BIN); no model calls
-  protocol --main-model SPEC     Protocol suite; scenario S1 today, S2-S4 in
-    [--runs N] [--timeout SEC]   ticket 03. SPEC is provider/model[:thinking]
+  protocol --main-model SPEC     Full protocol suite: S1 send-empty, S2
+    [--runs N] [--timeout SEC]   send-busy, S3 take, S4 not-yours — each run
+                                 from a fresh fixture; summary grouped by
+                                 actual Main-model. SPEC is
+                                 provider/model[:thinking]
   baseline [--expert-model SPEC] Persistent Expert baseline (ticket 05)
   economy [--main-model SPEC
            --expert-model SPEC]  Two-pane vs cached baseline (ticket 06/07)
@@ -175,6 +181,19 @@ grader_final_text() {
       end' "$1")" || return 1
   [ -n "$out" ] || return 1
   printf '%s\n' "$out"
+}
+
+# grader_final_matches FILE MODE PATTERN — exit 0 iff a final answer exists
+# (per grader_final_text) and matches PATTERN: MODE `re` greps case-
+# insensitive ERE, MODE `fix` an exact fixed string.
+grader_final_matches() {
+  local t
+  t="$(grader_final_text "$1")" || return 1
+  if [ "$2" = fix ]; then
+    printf '%s\n' "$t" | grep -qF "$3"
+  else
+    printf '%s\n' "$t" | grep -qiE "$3"
+  fi
 }
 
 # grader_usage FILE — usage totals as JSON. Sums usage from every assistant
@@ -371,7 +390,11 @@ parse_model_spec() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Protocol suite — scenario S1 (send-empty)
+# Protocol suite — scenario registry (S1–S4)
+#
+# A scenario is data (name, prompt, seed) plus a protocol_checks_**
+# function; protocol_run_one dispatches on the name. Seeds and prompts are
+# verbatim test data from the spec — do not rephrase them.
 # ─────────────────────────────────────────────────────────────────────────────
 
 S1_NAME="s1-send-empty"
@@ -380,6 +403,80 @@ S1_PROMPT='Ask the expert whether SQLite WAL mode prevents reader/writer locking
 # mention that the question was handed over (kept broad; the prompt asks the
 # model to send and stop, so a compliant answer always matches).
 S1_SEND_RE='sent|send|deliver|dispatch|forward|queue'
+
+# S2 shares the S1 prompt; the seeded busy inbox is the only difference.
+S2_NAME="s2-send-busy"
+S2_PROMPT="$S1_PROMPT"
+S2_SEED='from: main
+
+Existing consultation: check SQLite checkpoint behavior.'
+# Final-answer pattern for "explains the inbox is busy".
+S2_BUSY_RE='busy|occupied|not empty|already contains|занят|не пуст'
+
+S3_NAME="s3-take"
+S3_PROMPT='Check the two-pane workflow for an incoming message and tell me its marker.'
+S3_SEED='from: expert
+
+FYI only; no action or inbox reply is requested. Marker: WAL-MODE-7F3A.'
+S3_MARKER='WAL-MODE-7F3A'
+
+S4_NAME="s4-not-yours"
+S4_PROMPT='Check the two-pane workflow for an incoming message and report its status.'
+S4_SEED='from: main
+
+Question waiting for the expert. Marker: EXPERT-ONLY-91C2.'
+# Final-answer pattern for "the message is addressed to the other role".
+S4_NOT_YOURS_RE='expert|other role|awaiting|not for me|not addressed to me|not mine'
+
+PROTOCOL_SCENARIOS=("$S1_NAME" "$S2_NAME" "$S3_NAME" "$S4_NAME")
+
+scenario_seed() { # scenario — write the scenario's seed inbox into the fixture
+  case "$1" in
+    "$S1_NAME") : >"$EVAL_WORKDIR/.2pane/INBOX.md" ;;
+    "$S2_NAME") printf '%s\n' "$S2_SEED" >"$EVAL_WORKDIR/.2pane/INBOX.md" ;;
+    "$S3_NAME") printf '%s\n' "$S3_SEED" >"$EVAL_WORKDIR/.2pane/INBOX.md" ;;
+    "$S4_NAME") printf '%s\n' "$S4_SEED" >"$EVAL_WORKDIR/.2pane/INBOX.md" ;;
+    *) eval_die "unknown scenario: $1" ;;
+  esac
+}
+
+scenario_prompt() { # scenario — the prompt, verbatim from the spec
+  case "$1" in
+    "$S1_NAME") printf '%s\n' "$S1_PROMPT" ;;
+    "$S2_NAME") printf '%s\n' "$S2_PROMPT" ;;
+    "$S3_NAME") printf '%s\n' "$S3_PROMPT" ;;
+    "$S4_NAME") printf '%s\n' "$S4_PROMPT" ;;
+    *) eval_die "unknown scenario: $1" ;;
+  esac
+}
+
+scenario_checks() { # scenario run_dir sess — dispatch to the checks function
+  case "$1" in
+    "$S1_NAME") protocol_checks_s1 "$2" "$3" ;;
+    "$S2_NAME") protocol_checks_s2 "$2" "$3" ;;
+    "$S3_NAME") protocol_checks_s3 "$2" "$3" ;;
+    "$S4_NAME") protocol_checks_s4 "$2" "$3" ;;
+    *) eval_die "unknown scenario: $1" ;;
+  esac
+}
+
+# protocol_checks_common TAG RUN_DIR SESS_JSONL — assertions shared by every
+# protocol scenario: no direct runtime access, bash only through the helper,
+# fixture untouched outside the runtime state.
+protocol_checks_common() {
+  local tag="$1" run_dir="$2" sess="$3" v nb nh
+
+  v=0; [ -z "$(grader_forbidden_calls "$sess")" ] && v=1
+  check_bool "$tag: no forbidden direct runtime access in tool calls" "$v"
+
+  nb=$(grader_bash_calls "$sess" | grep -c . || true)
+  nh=$(grader_helper_calls "$sess" | grep -c . || true)
+  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
+  check_bool "$tag: every bash call is a standalone ./2pane helper invocation ($nb bash, $nh helper)" "$v"
+
+  v=0; cmp -s "$run_dir/before-manifest.sha256" "$run_dir/after-manifest.sha256" && v=1
+  check_bool "$tag: files outside .2pane unchanged (manifest equal)" "$v"
+}
 
 # protocol_checks_s1 RUN_DIR SESS_JSONL — S1 assertions against a valid,
 # model-matching session plus the actual fixture state. Appends to CHECKS_FILE.
@@ -399,39 +496,108 @@ protocol_checks_s1() {
   v=0; { grep -qi wal "$inbox" && grep -qi lock "$inbox"; } && v=1
   check_bool "S1: inbox body mentions WAL and lock (case-insensitive)" "$v"
 
-  # 4. No forbidden direct runtime access in any tool call.
-  v=0; [ -z "$(grader_forbidden_calls "$sess")" ] && v=1
-  check_bool "S1: no forbidden direct runtime access in tool calls" "$v"
-
-  # 5. Protocol suite rule: every bash call is a standalone ./2pane helper
-  #    invocation (helper calls are a subset of bash calls; count equality
-  #    means no other bash command ran).
-  local nb nh
-  nb=$(grader_bash_calls "$sess" | grep -c . || true)
-  nh=$(grader_helper_calls "$sess" | grep -c . || true)
-  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
-  check_bool "S1: every bash call is a standalone ./2pane helper invocation ($nb bash, $nh helper)" "$v"
-
-  # 6. Files outside .2pane unchanged.
-  v=0; cmp -s "$run_dir/before-manifest.sha256" "$run_dir/after-manifest.sha256" && v=1
-  check_bool "S1: files outside .2pane unchanged (manifest equal)" "$v"
-
-  # 7. Final answer reports the send and stops.
-  local final_txt="" present=0 reports=0
-  if final_txt="$(grader_final_text "$sess")"; then
-    present=1
-    printf '%s\n' "$final_txt" | grep -qiE "$S1_SEND_RE" && reports=1
-  fi
-  v=0; { [ "$present" = 1 ] && [ "$reports" = 1 ]; } && v=1
+  # 4. Final answer reports the send and stops.
+  v=0; grader_final_matches "$sess" re "$S1_SEND_RE" && v=1
   check_bool "S1: final answer reports the send and stops (pattern: $S1_SEND_RE)" "$v"
+
+  protocol_checks_common S1 "$run_dir" "$sess"
 }
 
-# protocol_run_one RUN_ROOT MAIN_SPEC K TIMEOUT_SEC — rebuild fixture, seed,
-# run pi once, harvest artifacts, grade S1. Returns 0 pass, 1 protocol-fail,
-# 3 infra-fail. Appends a per-run JSON object to RUN_ROOT/.runs.ndjson.
+# protocol_checks_s2 RUN_DIR SESS_JSONL — the helper must refuse the send
+# against the seeded busy inbox and leave it byte-identical; the final answer
+# must explain the busy inbox.
+protocol_checks_s2() {
+  local run_dir="$1" sess="$2"
+  local inbox="$EVAL_WORKDIR/.2pane/INBOX.md" v
+
+  # 1. A send was attempted through the helper and the helper refused it:
+  #    errored tool result carrying the helper's rejection text.
+  v=0; grader_helper_calls "$sess" send \
+    | awk -F'\t' '$5=="error" && $6 ~ /inbox is not empty/' | grep -q . && v=1
+  check_bool "S2: ./2pane send attempted and helper refused it ('inbox is not empty' in errored tool result)" "$v"
+
+  # 2. The seeded inbox survived the refusal byte-for-byte.
+  v=0; cmp -s "$inbox" "$run_dir/seed-INBOX.md" && v=1
+  check_bool "S2: INBOX.md byte-identical to the seed" "$v"
+
+  # 3. Final answer explains that the inbox is busy.
+  v=0; grader_final_matches "$sess" re "$S2_BUSY_RE" && v=1
+  check_bool "S2: final answer explains the inbox is busy (pattern: $S2_BUSY_RE)" "$v"
+
+  protocol_checks_common S2 "$run_dir" "$sess"
+}
+
+# protocol_checks_s3 RUN_DIR SESS_JSONL — a successful take consumes the
+# expert FYI: no leftover consume state, no send after the consume, and the
+# marker reaches the final answer.
+protocol_checks_s3() {
+  local run_dir="$1" sess="$2"
+  local inbox="$EVAL_WORKDIR/.2pane/INBOX.md" v
+  local consuming="$EVAL_WORKDIR/.2pane/consuming.md"
+
+  # 1. A completed-successfully bash call of ./2pane take.
+  v=0; grader_helper_calls "$sess" take | awk -F'\t' '$5=="ok"' | grep -q . && v=1
+  check_bool "S3: successful ./2pane take bash call paired with an ok tool result" "$v"
+
+  # 2. That take's tool result carries the expert message with its marker.
+  v=0; grader_helper_calls "$sess" take \
+    | awk -F'\t' -v m="$S3_MARKER" '$5=="ok" && $6 ~ /from: expert/ && index($6, m)' | grep -q . && v=1
+  check_bool "S3: take tool result contains 'from: expert' and $S3_MARKER" "$v"
+
+  # 3. The message was consumed: inbox exists and is empty, no consuming.md.
+  v=0; { [ -f "$inbox" ] && [ ! -s "$inbox" ] && [ ! -e "$consuming" ]; } && v=1
+  check_bool "S3: take consumed the message (inbox exists and is empty, no consuming.md)" "$v"
+
+  # 4. No ./2pane send after the take that consumed the message (JSONL
+  #    event order; a failed send before the take does not violate this).
+  local take_seq send_after=0
+  take_seq="$(grader_helper_calls "$sess" take | awk -F'\t' '$5=="ok" {print $1; exit}')"
+  if [ -n "$take_seq" ]; then
+    if grader_helper_calls "$sess" send | awk -F'\t' -v t="$take_seq" '($1+0) >= (t+0)' | grep -q .; then
+      send_after=1
+    fi
+  fi
+  v=0; { [ -n "$take_seq" ] && [ "$send_after" = 0 ]; } && v=1
+  check_bool "S3: no ./2pane send after the take" "$v"
+
+  # 5. Final answer carries the exact marker.
+  v=0; grader_final_matches "$sess" fix "$S3_MARKER" && v=1
+  check_bool "S3: final answer contains the exact marker $S3_MARKER" "$v"
+
+  protocol_checks_common S3 "$run_dir" "$sess"
+}
+
+# protocol_checks_s4 RUN_DIR SESS_JSONL — take must report the message as
+# awaiting the other role, preserve the seeded inbox byte-for-byte and not
+# start a consume.
+protocol_checks_s4() {
+  local run_dir="$1" sess="$2"
+  local inbox="$EVAL_WORKDIR/.2pane/INBOX.md" v
+  local consuming="$EVAL_WORKDIR/.2pane/consuming.md"
+
+  # 1. A take was attempted and its tool result reports the not-yours refusal.
+  v=0; grader_helper_calls "$sess" take \
+    | awk -F'\t' '$6 ~ /inbox message is awaiting the other role/' | grep -q . && v=1
+  check_bool "S4: ./2pane take tool result reports 'inbox message is awaiting the other role'" "$v"
+
+  # 2. Seeded inbox preserved byte-for-byte, no consume state left behind.
+  v=0; { cmp -s "$inbox" "$run_dir/seed-INBOX.md" && [ ! -e "$consuming" ]; } && v=1
+  check_bool "S4: INBOX.md byte-identical to the seed and no consuming.md" "$v"
+
+  # 3. Final answer reports the message is for the Expert/other role.
+  v=0; grader_final_matches "$sess" re "$S4_NOT_YOURS_RE" && v=1
+  check_bool "S4: final answer reports the message is for the Expert/other role (pattern: $S4_NOT_YOURS_RE)" "$v"
+
+  protocol_checks_common S4 "$run_dir" "$sess"
+}
+
+# protocol_run_one RUN_ROOT MAIN_SPEC SCENARIO K TIMEOUT_SEC — rebuild fixture,
+# seed, run pi once, harvest artifacts, grade the scenario. Returns 0 pass,
+# 1 protocol-fail, 3 infra-fail. Appends a per-run JSON object to
+# RUN_ROOT/.runs.ndjson.
 protocol_run_one() {
-  local run_root="$1" main_spec="$2" k="$3" timeout_sec="$4"
-  local run_dir="$run_root/$S1_NAME-r$k"
+  local run_root="$1" main_spec="$2" scenario="$3" k="$4" timeout_sec="$5"
+  local run_dir="$run_root/$scenario-r$k"
   local sessions_dir="$run_dir/sessions"
   mkdir -p "$sessions_dir"
   CHECKS_FILE="$run_dir/checks.txt"
@@ -443,10 +609,11 @@ protocol_run_one() {
   started_at="$(utc_now)"
 
   fixture_rebuild
-  # S1 seed: empty inbox (init leaves it empty; make it explicit).
-  : >"$EVAL_WORKDIR/.2pane/INBOX.md"
+  scenario_seed "$scenario"
   cp "$EVAL_WORKDIR/.2pane/INBOX.md" "$run_dir/seed-INBOX.md"
-  printf '%s\n' "$S1_PROMPT" >"$run_dir/prompt.txt"
+  local prompt
+  prompt="$(scenario_prompt "$scenario")"
+  printf '%s\n' "$prompt" >"$run_dir/prompt.txt"
   manifest_of "$EVAL_WORKDIR" >"$run_dir/before-manifest.sha256"
   local skill_sha
   skill_sha="$($EVAL_SHA256 "$EVAL_WORKDIR/.agents/skills/two-pane-workflow/SKILL.md" | awk '{print $1}')"
@@ -458,7 +625,7 @@ protocol_run_one() {
     cd "$EVAL_WORKDIR"
     # shellcheck disable=SC2046  # intentional splitting into repeated -u NAME args
     exec env $(printf -- '-u %s ' "${EVAL_ENV_RESET[@]}") \
-      "$EVALS_PI_BIN" "${flag_args[@]}" "$S1_PROMPT" </dev/null
+      "$EVALS_PI_BIN" "${flag_args[@]}" "$prompt" </dev/null
   ) >"$run_dir/pi.log" 2>&1 &
   EVAL_RUN_PID=$!
   (
@@ -526,7 +693,7 @@ protocol_run_one() {
   if [ "$infra" = 1 ]; then
     check_note "# protocol checks skipped: infrastructure failure"
   else
-    protocol_checks_s1 "$run_dir" "$sess"
+    scenario_checks "$scenario" "$run_dir" "$sess"
   fi
 
   local status
@@ -550,7 +717,7 @@ protocol_run_one() {
   git_commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
   flags_json=$(printf '%s\n' "${flag_args[@]}" | jq -R . | jq -s .)
   jq -n \
-    --arg suite protocol --arg scenario "$S1_NAME" --argjson run "$k" --arg role main \
+    --arg suite protocol --arg scenario "$scenario" --argjson run "$k" --arg role main \
     --arg requestedModel "$main_spec" --arg provider "$REQ_PROVIDER" --arg model "$REQ_MODEL" \
     --arg thinkingRequested "$REQ_THINKING" --arg thinkingObserved "$thinking_observed" \
     --arg actualModels "$(printf '%s\n' "$actual_models")" \
@@ -575,7 +742,7 @@ protocol_run_one() {
   local total ok_n
   ok_n=$(grep -c '^ok - ' "$CHECKS_FILE" || true)
   total=$((ok_n + CHECK_FAIL))
-  jq -cn --arg scenario "$S1_NAME" --argjson run "$k" --arg status "$status" \
+  jq -cn --arg scenario "$scenario" --argjson run "$k" --arg status "$status" \
     --argjson passed "$ok_n" --argjson failed "$CHECK_FAIL" \
     --argjson total "$total" \
     --arg requestedModel "$main_spec" --arg actualModels "$(printf '%s' "$actual_models" | tr '\n' ' ')" \
@@ -585,7 +752,7 @@ protocol_run_one() {
 
   printf 'evals: run root: %s\n' "$run_root"
   cat "$CHECKS_FILE"
-  printf 'evals: %s-r%s: %s (%s ok, %s not ok)\n' "$S1_NAME" "$k" "$status" "$ok_n" "$CHECK_FAIL"
+  printf 'evals: %s-r%s: %s (%s ok, %s not ok)\n' "$scenario" "$k" "$status" "$ok_n" "$CHECK_FAIL"
 
   case "$status" in
     pass) return 0 ;;
@@ -618,7 +785,7 @@ cmd_protocol() {
   case "$timeout_sec" in ''|*[!0-9]*|0) eval_die "--timeout must be a positive integer (seconds)" ;; esac
   command -v jq >/dev/null 2>&1 || eval_die "jq is required"
 
-  local stamp run_root k rc worst=0
+  local stamp run_root scenario k rc any_protocol=0 any_infra=0
   stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   run_root="$EVAL_RESULTS_DIR/$stamp"
 
@@ -629,30 +796,69 @@ cmd_protocol() {
   mkdir -p "$run_root"
   : >"$run_root/.runs.ndjson"
 
-  for ((k = 1; k <= runs; k++)); do
-    rc=0; protocol_run_one "$run_root" "$main_spec" "$k" "$timeout_sec" || rc=$?
-    if [ "$rc" -gt "$worst" ]; then worst=$rc; fi
+  # Every scenario×run starts from its own freshly rebuilt, freshly seeded
+  # fixture, so a failure or crash in one run cannot leak into the next.
+  for scenario in "${PROTOCOL_SCENARIOS[@]}"; do
+    for ((k = 1; k <= runs; k++)); do
+      rc=0; protocol_run_one "$run_root" "$main_spec" "$scenario" "$k" "$timeout_sec" || rc=$?
+      case "$rc" in
+        1) any_protocol=1 ;;
+        3) any_infra=1 ;;
+      esac
+    done
   done
 
   lock_release
 
-  # summary.json / summary.txt at the timestamp root.
-  jq -s '{suite:"protocol", requestedModel:.[0].requestedModel, runs:.}' \
-    "$run_root/.runs.ndjson" >"$run_root/summary.json"
+  # A protocol failure is the primary signal, so it wins the overall exit
+  # code over infra noise from other runs (both are nonzero either way).
+  local overall=pass overall_rc=0
+  if [ "$any_protocol" = 1 ]; then
+    overall=protocol-fail overall_rc=1
+  elif [ "$any_infra" = 1 ]; then
+    overall=infra-fail overall_rc=3
+  fi
+
+  # summary.json / summary.txt at the timestamp root, grouped by the actual
+  # Main-model observed in the sessions (falls back to the requested spec
+  # when no assistant message survived to report a model) with passed/N,
+  # protocol failures and infra failures per scenario.
+  jq -s --arg overall "$overall" '
+    def modelkey: (.actualModels[0] // .requestedModel);
+    {
+      suite: "protocol",
+      requestedModel: .[0].requestedModel,
+      overall: $overall,
+      totals: {
+        runs: length,
+        passed: (map(select(.status == "pass")) | length),
+        protocolFails: (map(select(.status == "protocol-fail")) | length),
+        infraFails: (map(select(.status == "infra-fail")) | length)
+      },
+      groups: (group_by(modelkey) | map({
+        model: (.[0] | modelkey),
+        scenarios: (group_by(.scenario) | map({
+          scenario: .[0].scenario,
+          runs: length,
+          passed: (map(select(.status == "pass")) | length),
+          protocolFails: (map(select(.status == "protocol-fail")) | length),
+          infraFails: (map(select(.status == "infra-fail")) | length),
+          runResults: (map({run, status, passed, failed, total}))
+        }))
+      }))
+    }' "$run_root/.runs.ndjson" >"$run_root/summary.json"
   {
     printf 'protocol summary %s\n' "$stamp"
-    printf 'main-model: %s\n' "$main_spec"
-    jq -r '"\(.scenario)-r\(.run): \(.status) (\(.passed)/\(.total) checks)"' \
-      "$run_root/.runs.ndjson"
-    printf 'overall: '
-    case "$worst" in
-      0) printf 'pass\n' ;;
-      1) printf 'protocol-fail\n' ;;
-      *) printf 'infra-fail\n' ;;
-    esac
+    printf 'requested main-model: %s\n' "$main_spec"
+    jq -r '.groups[]
+      | "main-model \(.model):",
+        (.scenarios[]
+         | "  \(.scenario): \(.passed)/\(.runs) passed, \(.protocolFails) protocol-fail, \(.infraFails) infra-fail")' \
+      "$run_root/summary.json"
+    printf 'overall: %s\n' "$overall"
   } >"$run_root/summary.txt"
   cat "$run_root/summary.txt"
-  return "$worst"
+  return "$overall_rc"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -828,6 +1034,20 @@ EOF
   else
     check "no-final: absent final message signals cleanly" 0
   fi
+  grader_final_matches "$TMP/ok-send.jsonl" re 'sent|deliver'; \
+    check "ok-send: final_matches re mode accepts ERE" $?
+  grader_final_matches "$TMP/ok-send.jsonl" re 'SENT'; \
+    check "ok-send: final_matches re mode is case-insensitive" $?
+  if grader_final_matches "$TMP/ok-send.jsonl" fix 'SENT'; then
+    check "ok-send: final_matches fix mode is exact" 1
+  else
+    check "ok-send: final_matches fix mode is exact" 0
+  fi
+  if grader_final_matches "$TMP/no-final.jsonl" re 'anything'; then
+    check "no-final: final_matches fails without a final message" 1
+  else
+    check "no-final: final_matches fails without a final message" 0
+  fi
 
   # ── usage summation ──
   expect_eq "ok-send: usage totals over two assistant messages" \
@@ -862,6 +1082,22 @@ EOF
   check "harness: second rebuild starts from an identical state" \
     "$(cmp -s "$TMP/manifest-a.sha256" "$TMP/manifest-b.sha256"; echo $?)"
 
+  # ── unit: S3 ordering check flags a send after a successful take ──
+  # Fixture F7 (take-then-send) is otherwise compliant, so exactly the
+  # ordering assertion must fail when protocol_checks_s3 grades it.
+  CHECKS_FILE="$TMP/s3-order-checks.txt"; CHECK_FAIL=0; : >"$CHECKS_FILE"
+  : >"$EVAL_WORKDIR/.2pane/INBOX.md"
+  rm -f "$EVAL_WORKDIR/.2pane/consuming.md"
+  mkdir -p "$TMP/s3-unit-run"
+  manifest_of "$EVAL_WORKDIR" >"$TMP/s3-unit-run/before-manifest.sha256"
+  cp "$TMP/s3-unit-run/before-manifest.sha256" "$TMP/s3-unit-run/after-manifest.sha256"
+  protocol_checks_s3 "$TMP/s3-unit-run" "$TMP/take-then-send.jsonl"
+  check "unit/S3: send after take is flagged" \
+    "$(grep -q '^not ok - S3: no ./2pane send after the take$' "$CHECKS_FILE"; echo $?)"
+  expect_eq "unit/S3: only the ordering assertion fails" \
+    "$(grep -c '^not ok - ' "$CHECKS_FILE" || true)" "1"
+  CHECKS_FILE=""; CHECK_FAIL=0
+
   # ── harness: end-to-end pipeline with a stub pi (zero model calls) ──
   #
   # Each case runs this script as a child with EVALS_PI_BIN pointing at a
@@ -875,40 +1111,101 @@ EOF
     run_root=$(printf '%s\n' "$out" | sed -n 's/^evals: run root: //p' | head -n1)
   }
 
-  # Stub A: compliant S1 run — real ./2pane send plus a fabricated session.
-  cat >"$TMP/pi-ok" <<'STUB'
+  # Stub A: compliant across the whole suite — the stub inspects the prompt
+  # (and, for the shared S1/S2 prompt, the seeded inbox) and drives the real
+  # helper for its side effects, then fabricates the matching session JSONL.
+  # --runs 2 proves scenario-run independence: every repeat starts from a
+  # freshly rebuilt, freshly seeded fixture.
+  cat >"$TMP/pi-suite" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" = "--version" ]; then printf 'stub-pi 0.0.0\n'; exit 0; fi
-sessdir="" prev=""
+sessdir="" prev="" prompt=""
 for a in "$@"; do
   [ "$prev" = "--session-dir" ] && sessdir="$a"
+  prompt="$a"
   prev="$a"
 done
-./2pane send 'Does SQLite WAL mode prevent reader/writer locking?' >/dev/null
-cat >"$sessdir/stub.jsonl" <<'JSONL'
-{"type":"session","version":3,"id":"s1","timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
-{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-08-22T00:00:00.100Z","provider":"openai-codex","modelId":"gpt-5.6-luna"}
-{"type":"message","id":"e1","parentId":"m1","timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}
-{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"./2pane send 'Does SQLite WAL mode prevent reader/writer locking?'"}}],"usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.01}}}}
-{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","isError":false,"content":[{"type":"text","text":"sent as main"}]}}
-{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"stop","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"text","text":"Sent the question to the Expert pane."}],"usage":{"input":150,"output":20,"totalTokens":170,"cost":{"total":0.02}}}}
+# write_session COMMAND ISERROR RESULT_JSON_TEXT FINAL_TEXT — RESULT_JSON_TEXT
+# must be one line with JSON escapes (\n for newlines) already in place.
+write_session() {
+  cat >"$sessdir/stub.jsonl" <<JSONL
+{"type":"session","version":3,"id":"suite","timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"prompt"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"$1"}}],"usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.01}}}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","isError":$2,"content":[{"type":"text","text":"$3"}]}}
+{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-22T00:00:03.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-luna","stopReason":"stop","timestamp":"2026-08-22T00:00:03.000Z","content":[{"type":"text","text":"$4"}],"usage":{"input":150,"output":20,"totalTokens":170,"cost":{"total":0.02}}}}
 JSONL
-printf 'Sent the question to the Expert pane.\n'
+  printf '%s\n' "$4"
+}
+case "$prompt" in
+  *marker*)  # S3: take consumes the expert FYI; the marker reaches the answer.
+    ./2pane take >/dev/null
+    write_session './2pane take' false 'from: expert\n\nFYI only; no action or inbox reply is requested. Marker: WAL-MODE-7F3A.' \
+      'The incoming message was an FYI from the expert; the marker was WAL-MODE-7F3A.'
+    ;;
+  *status*)  # S4: take reports that the message awaits the other role.
+    ./2pane take >/dev/null 2>&1 || true
+    write_session './2pane take' true '2pane: inbox message is awaiting the other role' \
+      'The inbox holds a question waiting for the expert, not for me.'
+    ;;
+  *two-pane*)  # S1/S2 share one prompt: the seeded inbox tells them apart.
+    if [ -s .2pane/INBOX.md ]; then
+      ./2pane send 'Does SQLite WAL mode prevent reader/writer locking?' >/dev/null 2>&1 || true
+      write_session "./2pane send 'Does SQLite WAL mode prevent reader/writer locking?'" true '2pane: inbox is not empty' \
+        'The inbox is busy: an existing consultation is still waiting, so nothing was sent.'
+    else
+      ./2pane send 'Does SQLite WAL mode prevent reader/writer locking?' >/dev/null
+      write_session "./2pane send 'Does SQLite WAL mode prevent reader/writer locking?'" false 'sent as main' \
+        'Sent the question to the Expert pane.'
+    fi
+    ;;
+  *)
+    exit 2 ;;
+esac
 exit 0
 STUB
-  chmod +x "$TMP/pi-ok"
-  run_stub "$TMP/pi-ok"
-  check "harness/stub-ok: compliant run classifies pass (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
-  check "harness/stub-ok: checks.txt records classification pass" \
-    "$(grep -q '^# classification: pass$' "$run_root/$S1_NAME-r1/checks.txt" 2>/dev/null; echo $?)"
-  check "harness/stub-ok: full artifact set written" \
+  chmod +x "$TMP/pi-suite"
+  run_stub "$TMP/pi-suite" --runs 2
+  check "harness/stub-suite: compliant suite classifies pass (rc=$rc)" "$(if [  "$rc" -eq 0  ]; then echo 0; else echo 1; fi)"
+  expect_eq "harness/stub-suite: --runs 2 grades every scenario twice" \
+    "$(find "$run_root" -mindepth 1 -maxdepth 1 -type d -name '*-r[0-9]*' | wc -l | tr -d ' ')" "8"
+  local s
+  for s in "$S1_NAME" "$S2_NAME" "$S3_NAME" "$S4_NAME"; do
+    check "harness/stub-suite: $s r1 and r2 classify pass" \
+      "$(if grep -q '^# classification: pass$' "$run_root/$s-r1/checks.txt" 2>/dev/null \
+         && grep -q '^# classification: pass$' "$run_root/$s-r2/checks.txt" 2>/dev/null; then echo 0; else echo 1; fi)"
+  done
+  check "harness/stub-suite: full artifact set written" \
     "$(for f in pi.log prompt.txt seed-INBOX.md before-manifest.sha256 after-manifest.sha256 metadata.json usage.json checks.txt session.jsonl; do
          [ -f "$run_root/$S1_NAME-r1/$f" ] || exit 1
        done; echo $?)"
-  check "harness/stub-ok: metadata pins model, flags and skill hash" \
+  check "harness/stub-suite: metadata pins model, flags and skill hash" \
     "$(jq -e '.requestedModel=="openai-codex/gpt-5.6-luna" and (.skillSha256|length==64) and (.flags|length>=10) and .envReset[0]=="AGENT_ROLE"' \
        "$run_root/$S1_NAME-r1/metadata.json" >/dev/null; echo $?)"
-  check "harness/stub-ok: lock released after run" "$(if [  ! -e "$EVAL_LOCKDIR"  ]; then echo 0; else echo 1; fi)"
+  expect_eq "suite: S2 seed stored verbatim" "$(cat "$run_root/$S2_NAME-r1/seed-INBOX.md")" "$S2_SEED"
+  expect_eq "suite: S3 seed stored verbatim" "$(cat "$run_root/$S3_NAME-r1/seed-INBOX.md")" "$S3_SEED"
+  expect_eq "suite: S4 seed stored verbatim" "$(cat "$run_root/$S4_NAME-r1/seed-INBOX.md")" "$S4_SEED"
+  expect_eq "suite: S3 prompt stored verbatim" "$(cat "$run_root/$S3_NAME-r1/prompt.txt")" "$S3_PROMPT"
+  check "suite/S2: helper refusal check passes" \
+    "$(grep -q '^ok - S2: ./2pane send attempted and helper refused' "$run_root/$S2_NAME-r1/checks.txt"; echo $?)"
+  check "suite/S2: byte-identical inbox check passes" \
+    "$(grep -q '^ok - S2: INBOX.md byte-identical to the seed$' "$run_root/$S2_NAME-r1/checks.txt"; echo $?)"
+  check "suite/S3: consumed-state check passes" \
+    "$(grep -q '^ok - S3: take consumed the message' "$run_root/$S3_NAME-r1/checks.txt"; echo $?)"
+  check "suite/S3: no-send-after-take check passes" \
+    "$(grep -q '^ok - S3: no ./2pane send after the take$' "$run_root/$S3_NAME-r1/checks.txt"; echo $?)"
+  check "suite/S4: not-yours result check passes" \
+    "$(grep -q '^ok - S4: ./2pane take tool result reports' "$run_root/$S4_NAME-r1/checks.txt"; echo $?)"
+  check "suite/S4: byte-identical inbox check passes" \
+    "$(grep -q '^ok - S4: INBOX.md byte-identical to the seed' "$run_root/$S4_NAME-r1/checks.txt"; echo $?)"
+  check "harness/stub-suite: summary.json groups by actual model" \
+    "$(jq -e '.overall=="pass" and .totals.runs==8 and .totals.passed==8
+        and .groups[0].model=="openai-codex/gpt-5.6-luna"
+        and (.groups[0].scenarios|length==4)
+        and .groups[0].scenarios[2].scenario=="s3-take"' "$run_root/summary.json" >/dev/null; echo $?)"
+  check "harness/stub-suite: summary.txt reports passed/N per scenario" \
+    "$(grep -q 's2-send-busy: 2/2 passed, 0 protocol-fail, 0 infra-fail' "$run_root/summary.txt"; echo $?)"
+  check "harness/stub-suite: lock released after run" "$(if [  ! -e "$EVAL_LOCKDIR"  ]; then echo 0; else echo 1; fi)"
   rm -rf "$run_root"
 
   # Stub B: protocol violation — direct cat of the inbox, no helper send.
@@ -940,6 +1237,10 @@ STUB
     "$(grep -q '^not ok - S1: successful ./2pane send' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
   check "harness/stub-bad: forbidden direct access is flagged" \
     "$(grep -q '^not ok - S1: no forbidden direct runtime access' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
+  check "harness/stub-bad: failure does not leak into later scenarios" \
+    "$(grep -q '^# classification: protocol-fail$' "$run_root/$S4_NAME-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "harness/stub-bad: summary counts the failures" \
+    "$(jq -e '.overall=="protocol-fail" and .totals.protocolFails==4' "$run_root/summary.json" >/dev/null; echo $?)"
   rm -rf "$run_root"
 
   # Stub C: hangs past the timeout — must classify infra-fail, release lock,
@@ -961,6 +1262,10 @@ STUB
     "$(grep -q '^# protocol checks skipped' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
   check "harness/stub-slow: lock released after timeout" "$(if [  ! -e "$EVAL_LOCKDIR"  ]; then echo 0; else echo 1; fi)"
   check "harness/stub-slow: fixture survives cleanup" "$(if [  -x "$EVAL_WORKDIR/2pane"  ]; then echo 0; else echo 1; fi)"
+  check "harness/stub-slow: every scenario run times out independently" \
+    "$(for s in "$S1_NAME" "$S2_NAME" "$S3_NAME" "$S4_NAME"; do
+         [ -f "$run_root/$s-r1/timeout.marker" ] || exit 1
+       done; echo $?)"
   rm -rf "$run_root"
 
   # Stub D: pi crash (immediate nonzero exit, no session).
@@ -975,6 +1280,10 @@ STUB
   check "harness/stub-crash: crash is not a protocol failure" \
     "$(grep -q '^# classification: infra-fail$' "$run_root/$S1_NAME-r1/checks.txt"; echo $?)"
   check "harness/stub-crash: lock released after crash" "$(if [  ! -e "$EVAL_LOCKDIR"  ]; then echo 0; else echo 1; fi)"
+  check "harness/stub-crash: last scenario also graded as infra-fail" \
+    "$(grep -q '^# classification: infra-fail$' "$run_root/$S4_NAME-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "harness/stub-crash: crash is reported separately from protocol quality" \
+    "$(jq -e '.overall=="infra-fail" and .totals.infraFails==4 and .totals.protocolFails==0' "$run_root/summary.json" >/dev/null; echo $?)"
   rm -rf "$run_root"
 
   # Lock conflict: a held lock must stop a second runner before any run.
