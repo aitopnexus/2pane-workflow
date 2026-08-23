@@ -59,6 +59,8 @@ The human triggers and serializes each inbox action. `AGENT_ROLE=expert` selects
 
 After any send, report its result in one line and yield until the human requests the next inbox action.
 
+Never inspect `.2pane/` directly; trust the helper's output and exit status.
+
 ## Send
 
 Run `./2pane send 'message'`.

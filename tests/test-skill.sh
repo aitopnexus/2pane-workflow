@@ -39,6 +39,7 @@ grep -q '\./2pane send' "$SKILL"; check "writes delegate to 2pane send" $?
 grep -q 'directly.*\./2pane send' "$SKILL"; check "reply sends directly without another read" $?
 grep -q 'send.*performs the slot check' "$SKILL"; check "send owns the slot check" $?
 grep -q 'yield until the human requests the next inbox action' "$SKILL"; check "send yields to the human router" $?
+grep -q 'Never inspect.*\.2pane/' "$SKILL"; check "skill forbids direct .2pane inspection" $?
 grep -q 'only its requested result fields' "$SKILL"; check "reply stays scoped to requested fields" $?
 word_count="$(wc -w < "$SKILL")"
 [ "$word_count" -le 120 ]; check "skill stays within its 120-word context budget" $?
