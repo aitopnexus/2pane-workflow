@@ -4,11 +4,15 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Acceptance
 
-- [ ] `grader_helper_calls` counts `./2pane send <<'EOF'…EOF` as a send helper call
-- [ ] `./2pane take` with input redirection, non-helper commands with heredocs, and piped variants stay rejected
-- [ ] Self-tests added to the F5/F5b family; suite green with zero model calls
-- [ ] Spec section «Запрет обхода helper» amended with the stdin-send allowance
+- [x] `grader_helper_calls` counts `./2pane send <<'EOF'…EOF` as a send helper call
+- [x] `./2pane take` with input redirection, non-helper commands with heredocs, and piped variants stay rejected
+- [x] Self-tests added to the F5/F5b family; suite green with zero model calls
+- [x] Spec section «Запрет обхода helper» amended with the stdin-send allowance
+
+## Comments
+
+Implemented in `helper_shape_sub` + new `send_tail_shape`: when the last `&&`-segment is `./2pane send` that is not standalone, it is accepted iff it is the helper's documented stdin mode — a here-document (operator alone on the first line, terminator word ≤8 alphanumerics with optional quotes, body closed by a terminator-only last line, `<<-` tab stripping honored) or a single `< file` redirection. `take` keeps the standalone-only rule (`./2pane take <file` rejected, pinned). Supporting changes: `split_unquoted_amp` became heredoc-aware and NUL-separated (a heredoc-bearing segment spans lines — a newline separator would shred it); TSV command fields round-trip through `unescape_tsv` so multi-line commands survive the jq pipeline; `command_is_standalone` now rejects `$(...)`/backticks inside double quotes (they execute there — caught live by re-grading the manual run's Expert session, whose first attempt `./2pane send "$(cat <<'EOF'…)"` previously slipped through as "quoted data"). Self-tests F11 (10 calls, live shapes) + subst-wrap pair; suite 237/237. Re-grade of the manual run: Expert's heredoc send now counts (take send), the substitution wrapper does not — exactly the ticket's intent.

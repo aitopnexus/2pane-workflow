@@ -4,11 +4,15 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Acceptance
 
-- [ ] Helper send with `.2pane`/`INBOX.md` mentioned inside the quoted message body is not forbidden
-- [ ] All existing bypass fixtures (direct cat, cd-into-.2pane, read of consuming.md) still flag
-- [ ] Non-bash tool calls keep the strict any-occurrence rule
-- [ ] Self-tests added; suite green with zero model calls; spec section «Запрет обхода helper» amended
+- [x] Helper send with `.2pane`/`INBOX.md` mentioned inside the quoted message body is not forbidden
+- [x] All existing bypass fixtures (direct cat, cd-into-.2pane, read of consuming.md) still flag
+- [x] Non-bash tool calls keep the strict any-occurrence rule
+- [x] Self-tests added; suite green with zero model calls; spec section «Запрет обхода helper» amended
+
+## Comments
+
+Implemented via `command_skeleton` (shared `heredoc_span` scanner): `grader_forbidden_calls` now splits bash vs other tools in jq and applies the runtime-path pattern to the bash command's SKELETON — text outside single/double-quoted spans and outside here-document bodies (substitution bodies stay in the skeleton: they execute). Payload mentions — quoted message text or heredoc body — no longer flag; unquoted operational paths (`cat .2pane/INBOX.md`, `cd …/.2pane && …`, `ls -R .2pane`) still do, and non-bash tools (read/edit/write) keep the strict any-occurrence rule. Known accepted gap, consistent with the spec's non-goal of defeating deliberate obfuscation: a fully-quoted runtime path passed to a non-helper command (`cat '.2pane/INBOX.md'`) slips the scan's LABEL — but still fails the bash-is-helper-only check, so the run is protocol-fail either way. Self-tests F11 cover the live shapes (glm's consultation mentioning `.2pane/INBOX.md` in its question text is now clean, sol's heredoc reply mentioning INBOX.md in the body is clean, direct cat/cd still flag); suite 237/237. Re-graded manual run: Main = 3 bash, 2 helper, 1 forbidden (only the real `cat .2pane/INBOX.md` self-check); Expert = 3 bash, 2 helper, 0 forbidden (the rejected third is the substitution wrapper, ticket 09).

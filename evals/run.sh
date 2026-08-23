@@ -47,6 +47,15 @@
 #              /tmp → /private/tmp, and a model reading the fixture docs via
 #              the canonical path was falsely flagged as reading outside
 #              the fixture (deterministic self-test added).
+#   tickets 09/10 (2026-08-23): helper recognition accepts the helper's
+#              documented stdin mode — `./2pane send <<'EOF'…EOF` and a
+#              single `< file` (take takes no stdin; the `"$(cat <<EOF)"`
+#              wrapper stays rejected: substitution executes even inside
+#              double quotes); the forbidden-path scan now runs on the
+#              command SKELETON (text outside quotes and heredoc bodies),
+#              so a runtime path mentioned in the message payload is not
+#              flagged as direct access — non-bash tools stay strict. Both
+#              shapes observed live in a manual two-pane run.
 #
 # Usage:
 #   evals/run.sh self-test
@@ -173,7 +182,8 @@ helper_subcommand() {
 
 # command_is_standalone COMMAND — exit 0 iff COMMAND is a single shell
 # invocation: no unquoted ; | & < > ( ) ` or $( that could chain a second
-# command, redirect, or substitute. Quoted text never disqualifies. This is
+# command, redirect, or substitute. Single-quoted text is inert data; inside
+# double quotes, `$(...)` and backticks still execute and disqualify. This is
 # a pragmatic scan, not a shell parser: the eval does not attempt to defeat
 # deliberately obfuscated bypasses.
 command_is_standalone() {
@@ -181,6 +191,12 @@ command_is_standalone() {
   for ((i = 0; i < ${#cmd}; i++)); do
     ch="${cmd:i:1}"
     if [ -n "$quote" ]; then
+      if [ "$quote" = '"' ]; then
+        # double quotes: $() and `..` still execute inside them
+        if [ "$ch" = "$" ] && [ "${cmd:i+1:1}" = "(" ]; then return 1; fi
+        [ "$ch" = '`' ] && return 1
+        [ "$ch" = "\\" ] && { i=$((i + 1)); continue; }
+      fi
       [ "$ch" = "$quote" ] && quote=""
       continue
     fi
@@ -193,11 +209,71 @@ command_is_standalone() {
   return 0
 }
 
+# unescape_tsv S — undo jq @tsv field escaping (\\, \t, \n, \r) so a
+# multi-line command round-trips through the TSV pipeline intact.
+unescape_tsv() {
+  local s="$1" p=$'\x01'
+  s="${s//\\\\/$p}"
+  s="${s//\\n/$'\n'}"
+  s="${s//\\t/$'\t'}"
+  s="${s//\\r/$'\r'}"
+  s="${s//$p/\\}"
+  printf '%s' "$s"
+}
+
+# heredoc_span CMD I — when CMD[I] is the first `<` of an unquoted `<<`
+# here-document operator: print "OP_END BODY_END" where OP_END is the index
+# just past the newline ending the operator line and BODY_END the index just
+# past the terminator line's newline (or the string length when the body
+# never closes). Return 1 when CMD[I] is not a heredoc start (single `<`,
+# `<<<`, or an unparsable terminator).
+heredoc_span() {
+  local cmd="$1" i="$2" n=${#1} j=$((i + 2)) q="" term="" c
+  [ "${cmd:i:1}" = "<" ] || return 1
+  [ "${cmd:i+1:1}" = "<" ] || return 1
+  [ "${cmd:j:1}" = "-" ] && j=$((j + 1))
+  case "${cmd:j:1}" in
+    "'") q="'"; j=$((j + 1)) ;;
+    '"') q='"'; j=$((j + 1)) ;;
+  esac
+  while (( j < n )); do
+    c="${cmd:j:1}"
+    if [ -n "$q" ]; then
+      [ "$c" = "$q" ] && { j=$((j + 1)); break; }
+      term+="$c"
+    else
+      [[ "$c" =~ [^A-Za-z0-9_] ]] && break
+      term+="$c"
+    fi
+    j=$((j + 1))
+  done
+  [ -n "$term" ] || return 1
+  while (( j < n )) && [ "${cmd:j:1}" != $'\n' ]; do j=$((j + 1)); done
+  local op_end=$(( j < n ? j + 1 : j ))
+  local k=$op_end line="" e stripped
+  while (( k < n )); do
+    e=$k
+    line=""
+    while (( e < n )) && [ "${cmd:e:1}" != $'\n' ]; do line+="${cmd:e:1}"; e=$((e + 1)); done
+    stripped="${line#"${line%%[!$'\t']*}"}"
+    if [ "$stripped" = "$term" ]; then
+      printf '%s %s\n' "$op_end" $(( e < n ? e + 1 : e ))
+      return 0
+    fi
+    [ "$e" -ge "$n" ] && break
+    k=$((e + 1))
+  done
+  printf '%s %s\n' "$op_end" "$n"
+}
+
 # split_unquoted_amp COMMAND — print COMMAND's segments split on unquoted
-# `&&`, quote-aware: a quoted && is data, not a chain.
+# `&&` (quote-aware; a quoted && is data, and so is the body of a
+# here-document — the whole heredoc stays inside its segment). Segments are
+# NUL-separated because a heredoc-bearing segment spans lines.
 split_unquoted_amp() {
-  local cmd="$1" i ch quote="" seg=""
-  for ((i = 0; i < ${#cmd}; i++)); do
+  local cmd="$1" i ch quote="" seg="" span op_end body_end
+  local n=${#cmd}
+  for ((i = 0; i < n; i++)); do
     ch="${cmd:i:1}"
     if [ -n "$quote" ]; then
       seg+="$ch"
@@ -206,9 +282,17 @@ split_unquoted_amp() {
     fi
     case "$ch" in
       "'"|'"') quote="$ch"; seg+="$ch" ;;
+      "<")
+        if span="$(heredoc_span "$cmd" "$i")"; then
+          read -r op_end body_end <<<"$span"
+          seg+="${cmd:i:body_end - i}"
+          i=$((body_end - 1))
+        else
+          seg+="$ch"
+        fi ;;
       "&")
         if [ "${cmd:i+1:1}" = "&" ]; then
-          printf '%s\n' "$seg"
+          printf '%s\0' "$seg"
           seg=""
           i=$((i + 1))
         else
@@ -217,7 +301,50 @@ split_unquoted_amp() {
       *) seg+="$ch" ;;
     esac
   done
-  printf '%s\n' "$seg"
+  printf '%s\0' "$seg"
+}
+
+# send_tail_shape LAST_SEG — exit 0 iff LAST_SEG is `./2pane send` feeding
+# its message on standard input: a here-document (operator alone on the
+# first line, terminator word up to 8 alphanumerics, body closed by a
+# terminator-only last line; `<<-` tab stripping honored) or a single
+# `< file` input redirection. Both are the helper's documented stdin mode
+# ("standard input"); `take` takes no stdin and is not covered here.
+send_tail_shape() {
+  local seg="$1" tail r first term body last stripped htoks
+  seg="${seg#"${seg%%[![:space:]]*}"}"
+  tail="${seg#./2pane}"
+  [ "$tail" = "$seg" ] && return 1
+  tail="${tail#"${tail%%[![:space:]]*}"}"
+  r="${tail#send}"
+  [ "$r" = "$tail" ] && return 1
+  tail="${r#"${r%%[![:space:]]*}"}"
+  case "$tail" in
+    "<<"*)
+      first="${tail%%$'\n'*}"
+      [ "$first" != "$tail" ] || return 1
+      body="${tail#*$'\n'}"
+      read -r -a htoks <<<"$first"
+      [ "${#htoks[@]}" -eq 1 ] || return 1
+      term="${htoks[0]#<<}"
+      term="${term#-}"
+      term="${term#\'}"; term="${term%\'}"
+      term="${term#\"}"; term="${term%\"}"
+      case "$term" in
+        ''|*[!A-Za-z0-9_]*) return 1 ;;
+        ?????????*) return 1 ;;
+      esac
+      last="${body##*$'\n'}"
+      stripped="${last#"${last%%[!$'\t']*}"}"
+      [ "$stripped" = "$term" ] || return 1
+      return 0 ;;
+    "<"*)
+      r="${tail#<}"
+      local redir_re='^[[:space:]]*[^[:space:];&|<>]+[[:space:]]*$'
+      [[ "$r" =~ $redir_re ]] || return 1
+      return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # helper_shape_sub COMMAND — prints `send`/`take` and exits 0 iff COMMAND is
@@ -233,11 +360,15 @@ split_unquoted_amp() {
 helper_shape_sub() {
   local cmd="$1" seg sub i
   local -a segs=() toks
-  while IFS= read -r seg; do segs+=("$seg"); done < <(split_unquoted_amp "$cmd")
+  while IFS= read -r -d '' seg; do segs+=("$seg"); done < <(split_unquoted_amp "$cmd")
   local n=${#segs[@]}
   [ "$n" -ge 1 ] || return 1
   sub="$(helper_subcommand "${segs[n-1]}")" || return 1
-  command_is_standalone "${segs[n-1]}" || return 1
+  if [ "$sub" = send ] && ! command_is_standalone "${segs[n-1]}"; then
+    send_tail_shape "${segs[n-1]}" || return 1
+  else
+    command_is_standalone "${segs[n-1]}" || return 1
+  fi
   for ((i = 0; i < n - 1; i++)); do
     read -r -a toks <<<"${segs[i]}"
     [ "${toks[0]-}" = cd ] || return 1
@@ -253,23 +384,69 @@ grader_helper_calls() {
   local want="${2-}" sub
   grader_tool_events "$1" | while IFS=$'\t' read -r seq id name command status text; do
     [ "$name" = "bash" ] || continue
-    sub="$(helper_shape_sub "$command")" || continue
+    sub="$(helper_shape_sub "$(unescape_tsv "$command")")" || continue
     { [ -z "$want" ] || [ "$sub" = "$want" ]; } || continue
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$seq" "$id" "$sub" "$command" "$status" "$text"
   done
 }
 
+# command_skeleton CMD — CMD with quoted spans and here-document bodies
+# removed: only operationally parsed text remains (command words, unquoted
+# paths, redirections; substitution bodies stay — they execute). A runtime
+# path inside quotes or a heredoc body is message payload, not access.
+command_skeleton() {
+  local cmd="$1" i ch quote="" out="" span op_end body_end
+  local n=${#cmd}
+  for ((i = 0; i < n; i++)); do
+    ch="${cmd:i:1}"
+    if [ -n "$quote" ]; then
+      if [ "$quote" = '"' ] && [ "$ch" = "\\" ]; then i=$((i + 1)); continue; fi
+      [ "$ch" = "$quote" ] && quote=""
+      continue
+    fi
+    case "$ch" in
+      "'") quote="'" ;;
+      '"') quote='"' ;;
+      "<")
+        if span="$(heredoc_span "$cmd" "$i")"; then
+          read -r op_end body_end <<<"$span"
+          out+="<heredoc> "
+          i=$((body_end - 1))
+        else
+          out+="$ch"
+        fi ;;
+      *) out+="$ch" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
 # grader_forbidden_calls FILE — TSV (seq, callId, toolName, serializedArgs) of
-# every tool call whose serialized arguments mention a runtime path
-# (.2pane, INBOX.md, consuming.md). A normal helper invocation contains none.
+# every tool call whose arguments reveal direct runtime access
+# (.2pane, INBOX.md, consuming.md). For bash the pattern is applied to the
+# command SKELETON (text outside quotes and heredoc bodies): mentioning a
+# runtime path inside the message payload is not access. For every other
+# tool any occurrence still flags — in read/edit/write arguments a runtime
+# path is operational by construction.
 grader_forbidden_calls() {
   jq -r -s '
     [.[] | select(.type=="message" and .message.role=="assistant")
         | .message.content[]? | select(.type=="toolCall")
-        | {seq: -1, id: (.id // ""), name: (.name // ""), args: (.arguments | tostring)}]
+        | {seq: -1, id: (.id // ""), name: (.name // ""),
+           kind: (if .name == "bash" then "bash" else "other" end),
+           args: (if .name == "bash" then (.arguments.command // "") else (.arguments | tostring) end)}]
     | to_entries | map(.value + {seq: .key})[]
-    | select(.args | test("\\.2pane|INBOX\\.md|consuming\\.md"))
-    | [(.seq | tostring), .id, .name, .args] | @tsv' "$1"
+    | [(.seq | tostring), .id, .name, .kind, .args] | @tsv' "$1" \
+  | while IFS=$'\t' read -r seq id name kind args; do
+      local scan
+      if [ "$kind" = bash ]; then
+        scan="$(command_skeleton "$(unescape_tsv "$args")")"
+      else
+        scan="$args"
+      fi
+      printf '%s\n' "$scan" | grep -Eq '\.2pane|INBOX\.md|consuming\.md' || continue
+      printf '%s\t%s\t%s\t%s\n' "$seq" "$id" "$name" "$args"
+    done
 }
 
 # grader_final_text FILE — the final answer: text blocks of the LAST assistant
@@ -2244,7 +2421,47 @@ EOF
   expect_eq "cd-prefix: cd-into-.2pane has helper shape" \
     "$(grader_helper_calls "$TMP/cd-dot2pane.jsonl" | grep -c 'call_H8' || true)" "1"
   expect_eq "cd-prefix: cd-into-.2pane still forbidden by the args scan" \
-    "$(grader_forbidden_calls "$TMP/cd-dot2pane.jsonl" | grep -c 'call_H8' || true)" "1"\
+    "$(grader_forbidden_calls "$TMP/cd-dot2pane.jsonl" | grep -c 'call_H8' || true)" "1"
+
+  # F11: stdin sends + payload mentions (tickets 09/10) — live shapes from
+  # the manual two-pane run: Expert delivered a long reply via
+  # `./2pane send <<'EOF' … EOF` (the documented stdin mode), and Main's
+  # legitimate consultation mentioned .2pane/INBOX.md inside the question
+  # text. Both must count as clean helper traffic; unquoted runtime paths
+  # stay flagged, take-with-stdin stays rejected.
+  cat >"$TMP/heredoc.jsonl" <<'EOF'
+{"type":"session","version":3,"timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"Consult."}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"call_K1","name":"bash","arguments":{"command":"./2pane send <<'EOF'\nVerdict: no lock. Re .2pane/INBOX.md safety: atomic rename suffices.\nEOF"}},{"type":"toolCall","id":"call_K2","name":"bash","arguments":{"command":"cd /tmp/wd && ./2pane  send <<-'EOT'\nlong body with && noise mentioning INBOX.md too\n\tEOT"}},{"type":"toolCall","id":"call_K3","name":"bash","arguments":{"command":"./2pane take </tmp/seed.txt"}},{"type":"toolCall","id":"call_K4","name":"bash","arguments":{"command":"cat <<'EOF'\nplain heredoc data\nEOF"}},{"type":"toolCall","id":"call_K5","name":"bash","arguments":{"command":"./2pane send <<'EOF'\nbody\nEOF | tee /tmp/log"}},{"type":"toolCall","id":"call_K6","name":"bash","arguments":{"command":"./2pane send 'question mentioning .2pane/INBOX.md and consuming.md in text'"}},{"type":"toolCall","id":"call_K7","name":"bash","arguments":{"command":"cat .2pane/INBOX.md"}},{"type":"toolCall","id":"call_K8","name":"bash","arguments":{"command":"cd /tmp/wd/.2pane && ./2pane take"}},{"type":"toolCall","id":"call_K9","name":"read","arguments":{"path":".2pane/consuming.md"}},{"type":"toolCall","id":"call_K10","name":"bash","arguments":{"command":"./2pane send < reply.txt"}}],"usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.011}}}}
+EOF
+
+  expect_eq "stdin-send: heredoc send counts as a helper send (incl cd-prefix, <<-, && in body)" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" send | wc -l | tr -d ' ')" "4"
+  expect_eq "stdin-send: subcommands in order (quoted-mention send included)" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | cut -f3 | tr '\n' ' ')" "send send send take send "
+  expect_eq "stdin-send: take with input redirection is not a helper call" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -c 'call_K3' || true)" "0"
+  expect_eq "stdin-send: non-helper heredoc command is not a helper call" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -c 'call_K4' || true)" "0"
+  expect_eq "stdin-send: piped-after-terminator send is not a helper call" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -c 'call_K5' || true)" "0"
+  expect_eq "mention: quoted payload mentions are not forbidden (send args, heredoc body, <file)" \
+    "$(grader_forbidden_calls "$TMP/heredoc.jsonl" | grep -Ec 'call_K1|call_K2|call_K6|call_K10' || true)" "0"
+  expect_eq "mention: unquoted runtime paths still forbidden (cat, cd-into)" \
+    "$(grader_forbidden_calls "$TMP/heredoc.jsonl" | grep -Ec 'call_K7|call_K8' || true)" "2"
+  expect_eq "mention: non-bash tools keep the strict any-occurrence rule" \
+    "$(grader_forbidden_calls "$TMP/heredoc.jsonl" | grep -c 'call_K9' || true)" "1"
+
+  # The substitution wrapper observed live (Expert's first attempt): the
+  # $(...) sits inside double quotes but still executes, so it is NOT
+  # standalone and not a helper call — the plain heredoc is the fallback.
+  cat >"$TMP/subst-wrap.jsonl" <<'EOF'
+{"type":"message","id":"e2","parentId":null,"timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"call_K11","name":"bash","arguments":{"command":"./2pane send \"$(cat <<'EOF'\nwrapped reply\nEOF\n)\""}},{"type":"toolCall","id":"call_K12","name":"bash","arguments":{"command":"./2pane send \"plain double-quoted reply\""}}]}}
+EOF
+  expect_eq 'subst-wrap: $(cat <<EOF) wrapper is not a helper call' \
+    "$(grader_helper_calls "$TMP/subst-wrap.jsonl" | grep -c 'call_K11' || true)" "0"
+  expect_eq "subst-wrap: static double-quoted send is a helper call" \
+    "$(grader_helper_calls "$TMP/subst-wrap.jsonl" | grep -c 'call_K12' || true)" "1"\
 
   local helpers
   helpers="$(grader_helper_calls "$TMP/take-then-send.jsonl")"
