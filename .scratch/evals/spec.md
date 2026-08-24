@@ -392,43 +392,40 @@ Main может не обращаться к Expert, обратиться оди
 
 ### Запрет обхода helper
 
-Используется комбинация узкого tool allowlist и проверок аргументов:
+Используется комбинация узкого tool allowlist и независимых проверок
+аргументов/состояния. Каждый bash call обязан классифицироваться как
+**helper** или **safe diagnostic**; неклассифицированный call запрещён.
 
-- в protocol suite любой bash call, кроме одного standalone
-  `./2pane send ...` или `./2pane take`, запрещён; chaining, redirection и
-  дополнительные shell commands в том же call не разрешаются.
-  Уточнение 2026-08-22: инертный префикс `cd DIR &&` перед standalone-
-  вызовом признаётся частью helper-вызова (cd не читает, не пишет и не
-  пайпит ничего; наблюдаемое поведение моделей, спеллярщих вызов с
-  абсолютным cwd). Всё остальное — другие команды до или после helper,
-  pipes, redirection, не-send/take — по-прежнему запрещено; последним
-  сегментом обязан быть сам helper; запрет `.2pane`/`INBOX.md`/
-  `consuming.md` в сериализованных аргументах действует независимо (так
-  что `cd …/.2pane && …` ловится второй линией);
-- уточнение 2026-08-23 (stdin-режим, тикет 09): `./2pane send` с
-  here-document (`<<'EOF' … EOF`, включая `<<-` и cd-префикс) или с
-  единственным входным redirection (`< file`) признаётся helper-вызовом —
-  это документированный режим helper'а («standard input»). `take` stdin
-  не принимает и признаётся только standalone; output-pipe после helper'а
-  и обёртка `"$(cat <<EOF…)"` запрещены (подстановка исполняется даже в
-  двойных кавычках);
-- в economy suite bash также разрешён только для helper, а `read` — только
-  для двух docs и не-runtime fixture-файлов;
-- любой tool call, в сериализованных аргументах которого встречается
-  `.2pane`, `INBOX.md` или `consuming.md`, запрещён. Нормальный вызов
-  `./2pane send ...` или `./2pane take` этих внутренних путей не содержит.
-  Уточнение 2026-08-23 (тикет 10): для bash-вызовов паттерн применяется к
-  «скелету» команды — тексту вне кавычек и тел here-document; упоминание
-  runtime-пути в тексте сообщения (payload) не является прямым доступом.
-  Для прочих инструментов (read/edit/write) действует прежнее строгое
-  правило — там runtime-путь в аргументах операционен по построению;
+- helper-вызов — standalone `./2pane send ...` / `./2pane take` либо
+  документированные безопасные варианты формы. Инертный префикс
+  `cd DIR &&` допускается. После helper разрешён только status diagnostic
+  `; echo "EXIT:$?"`; grader восстанавливает helper ok/error из `EXIT:N`.
+  Другие команды до/после, output-pipes и non-send/take запрещены. `send` может
+  получать payload через here-document (`<<'EOF' … EOF`, включая `<<-`) или
+  единственный input-redirection (`< file`) — это его documented stdin mode;
+  `take` stdin не принимает. Обёртка `"$(cat <<EOF…)"` запрещена:
+  command substitution исполняется даже в двойных кавычках;
+- safe diagnostic (тикет 11, решение владельца 2026-08-24) — read-only
+  fixture inspection через `ls/find/grep/sed/head/tail/cat/wc/sort/pwd`,
+  fixture-only `cd`, read-only `./2pane help|-h|--help` и узкий `echo` для
+  `AGENT_ROLE`/визуального разделителя. Разрешены цепочки и pipelines только
+  из этих команд. Запрещены network-команды, output-write
+  redirections, command substitution, mutation flags (`find -delete/-exec`,
+  `sed -i`), пути вне fixture и любые runtime-пути. Это pragmatic classifier,
+  не shell-security boundary;
+- `read` в economy разрешён только для non-runtime fixture-файлов;
+- любой tool call, содержащий операционный `.2pane`, `INBOX.md` или
+  `consuming.md`, запрещён. Для bash паттерн применяется к «скелету» команды
+  (тексту вне кавычек/тел heredoc): runtime-путь в message payload не является
+  доступом. Для read/edit/write действует строгое any-occurrence правило;
 - запрещены также edit/write/apply-patch вызовы по runtime-путям;
-- manifest и точные assertions состояния остаются второй линией проверки на
-  случай косвенной модификации через скрипт.
+- manifest и точные assertions состояния остаются независимой второй линией
+  на случай косвенной модификации через скрипт.
 
-Так нормальное поведение имеет очень узкую поверхность, а литеральный
-`cat .2pane/INBOX.md` и обычные обходы детектируются. Eval не пытается
-доказать защищённость от намеренно обфусцированного shell bypass.
+Так диагностическое поведение реальных моделей не смешивается с обходом
+workflow: `echo AGENT_ROLE` и read-only `grep/sed` по helper source допустимы,
+а литеральный `cat .2pane/INBOX.md` и обычные bypass'ы детектируются. Eval не
+пытается доказать защищённость от намеренно обфусцированного shell bypass.
 
 ### Финальный текст
 

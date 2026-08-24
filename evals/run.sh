@@ -56,6 +56,14 @@
 #              so a runtime path mentioned in the message payload is not
 #              flagged as direct access — non-bash tools stay strict. Both
 #              shapes observed live in a manual two-pane run.
+#   ticket 11 (2026-08-24): safe read-only diagnostics are distinct from
+#              workflow bypasses. Bash calls classify as helper, diagnostic
+#              (fixture-only ls/find/grep/sed/head/tail/cat/wc/sort/pwd,
+#              cd, read-only 2pane help or narrow AGENT_ROLE echo), or
+#              violation. Helper may append only `; echo "EXIT:$?"`; status
+#              is restored from the marker. Runtime paths, writes,
+#              network, mutation flags, substitution and outside paths still
+#              fail; forbidden-path + manifest checks remain independent.
 #
 # Usage:
 #   evals/run.sh self-test
@@ -228,7 +236,9 @@ unescape_tsv() {
 # never closes). Return 1 when CMD[I] is not a heredoc start (single `<`,
 # `<<<`, or an unparsable terminator).
 heredoc_span() {
-  local cmd="$1" i="$2" n=${#1} j=$((i + 2)) q="" term="" c
+  local cmd="$1" i="$2" n j q="" term="" c
+  n=${#cmd}
+  j=$((i + 2))
   [ "${cmd:i:1}" = "<" ] || return 1
   [ "${cmd:i+1:1}" = "<" ] || return 1
   [ "${cmd:j:1}" = "-" ] && j=$((j + 1))
@@ -347,17 +357,11 @@ send_tail_shape() {
   esac
 }
 
-# helper_shape_sub COMMAND — prints `send`/`take` and exits 0 iff COMMAND is
-# a helper invocation in the narrow allowed shape: the LAST `&&`-segment is
-# a standalone `./2pane send|take ...` (as before), optionally preceded only
-# by inert `cd DIR` segments (first token `cd`, no chaining/redirection —
-# cd cannot read, write or pipe anything, so a model spelling the call
-# `cd <workdir> && ./2pane send ...` is graded on the helper it ran).
-# Everything else — other commands before or after the helper, pipes,
-# redirections, non-send/take subcommands — still fails, and the
-# forbidden-path scan over serialized arguments applies independently
-# (`cd …/.2pane && …` stays a violation).
-helper_shape_sub() {
+# helper_core_shape_sub COMMAND — prints `send`/`take` and exits 0 iff
+# COMMAND is the core helper shape: the LAST `&&`-segment is standalone
+# `./2pane send|take ...`, optionally preceded only by inert `cd DIR`
+# segments. No trailing command is accepted here.
+helper_core_shape_sub() {
   local cmd="$1" seg sub i
   local -a segs=() toks
   while IFS= read -r -d '' seg; do segs+=("$seg"); done < <(split_unquoted_amp "$cmd")
@@ -377,16 +381,134 @@ helper_shape_sub() {
   printf '%s\n' "$sub"
 }
 
+# helper_status_echo_sub COMMAND — the sole accepted trailing diagnostic on a
+# helper call: `; echo "EXIT:$?"` (quotes optional, whitespace flexible).
+# Prints the core helper subcommand. The echo exposes the helper exit code
+# without touching workflow state; grader_helper_calls restores helper
+# ok/error from the emitted EXIT:N marker.
+helper_status_echo_sub() {
+  local cmd="$1" base
+  base="$(printf '%s\n' "$cmd" \
+    | sed -E 's/[[:space:]]*;[[:space:]]*echo[[:space:]]+"?EXIT:\$\?"?[[:space:]]*$//')"
+  [ "$base" != "$cmd" ] || return 1
+  helper_core_shape_sub "$base"
+}
+
+# helper_shape_sub COMMAND — core helper shape, optionally followed by the
+# narrow EXIT:$? diagnostic. Everything else — commands before/after,
+# pipes, arbitrary echo, non-send/take — fails. Forbidden-path scan remains
+# independent (`cd …/.2pane && …` stays a violation).
+helper_shape_sub() {
+  local cmd="$1" sub
+  if sub="$(helper_core_shape_sub "$cmd")"; then
+    printf '%s\n' "$sub"
+    return 0
+  fi
+  helper_status_echo_sub "$cmd"
+}
+
 # grader_helper_calls FILE [send|take] — TSV of bash tool events that are a
-# helper invocation in the allowed shape (standalone `./2pane <subcommand>`,
-# optionally cd-prefixed; fields as in grader_tool_events).
+# helper invocation in the allowed shape (standalone/cd-prefixed, optional
+# EXIT:$? diagnostic; fields as in grader_tool_events).
 grader_helper_calls() {
-  local want="${2-}" sub
+  local want="${2-}" sub cmd result exit_code
   grader_tool_events "$1" | while IFS=$'\t' read -r seq id name command status text; do
     [ "$name" = "bash" ] || continue
-    sub="$(helper_shape_sub "$(unescape_tsv "$command")")" || continue
+    cmd="$(unescape_tsv "$command")"
+    sub="$(helper_shape_sub "$cmd")" || continue
     { [ -z "$want" ] || [ "$sub" = "$want" ]; } || continue
+    if helper_status_echo_sub "$cmd" >/dev/null 2>&1; then
+      result="$(unescape_tsv "$text")"
+      exit_code="$(printf '%s\n' "$result" | sed -nE 's/^EXIT:([0-9]+)$/\1/p' | tail -n1)"
+      if [ -n "$exit_code" ]; then
+        if [ "$exit_code" = 0 ]; then status=ok; else status=error; fi
+      fi
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$seq" "$id" "$sub" "$command" "$status" "$text"
+  done
+}
+
+# diagnostic_command_shape COMMAND — exit 0 iff COMMAND is a read-only,
+# non-runtime diagnostic. Allowed commands: fixture inspection
+# (ls/find/grep/sed/head/tail/cat/wc/sort/pwd), fixture-only cd, read-only
+# `./2pane help|-h|--help`, and narrow echo diagnostics (AGENT_ROLE or a
+# visual separator). Pipelines/chains of those commands are
+# allowed; network, writes, mutation flags, command substitution, runtime
+# paths and paths outside the fixture are rejected. This is intentionally a
+# pragmatic classifier, not a shell security boundary; forbidden-path and
+# manifest checks remain independent gates.
+diagnostic_command_shape() {
+  local cmd="$1" skeleton scan normalized wdphys segments seg first seen=0 tmp
+  local -a toks
+
+  helper_shape_sub "$cmd" >/dev/null 2>&1 && return 1
+  printf '%s\n' "$cmd" | grep -Eq '\.2pane|INBOX\.md|consuming\.md' && return 1
+  local quoted_outside_re=$'[\x27\x22](/|\\.\\./)'
+  printf '%s\n' "$cmd" | grep -Eq "$quoted_outside_re" && return 1
+  local subst_marker=$'\x24\x28' backtick_marker=$'\x60'
+  case "$cmd" in *"$subst_marker"*|*"$backtick_marker"*) return 1 ;; esac
+
+  skeleton="$(command_skeleton "$cmd")"
+  scan="${skeleton//2>\/dev\/null/}"
+  scan="${scan//2>&1/}"
+  case "$scan" in *'>'*|*'<'*|*'||'*) return 1 ;; esac
+  tmp="${scan//&&/}"
+  case "$tmp" in *'&'*) return 1 ;; esac
+
+  # Normalize both literal and physical spellings of the fixed fixture path.
+  wdphys="$(cd "$(dirname "$EVAL_WORKDIR")" 2>/dev/null \
+    && printf '%s/%s' "$(pwd -P)" "$(basename "$EVAL_WORKDIR")" || true)"
+  normalized="$scan"
+  [ -n "$wdphys" ] && normalized="${normalized//$wdphys/.}"
+  normalized="${normalized//$EVAL_WORKDIR/.}"
+  normalized="${normalized//\/dev\/null/}"
+  printf '%s\n' "$normalized" \
+    | grep -Eq '(^|[[:space:];|])\.\.(/|[[:space:];|]|$)' && return 1
+  printf '%s\n' "$normalized" \
+    | grep -Eq '(^|[[:space:];|])/[^[:space:];|]+' && return 1
+
+  segments="${scan//&&/$'\n'}"
+  segments="${segments//|/$'\n'}"
+  segments="${segments//;/$'\n'}"
+  local echo_re='^echo[[:space:]]+-+[[:space:]]*$'
+  while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"
+    seg="${seg%"${seg##*[![:space:]]}"}"
+    [ -n "$seg" ] || continue
+    read -r -a toks <<<"$seg"
+    first="${toks[0]-}"
+    case "$first" in
+      cd)
+        [ "${#toks[@]}" -eq 2 ] || return 1
+        case "${toks[1]}" in ''|-*) return 1 ;; esac ;;
+      ./2pane)
+        case "${toks[1]-}" in help|-h|--help) ;; *) return 1 ;; esac ;;
+      find)
+        printf '%s\n' "$seg" \
+          | grep -Eq '(^|[[:space:]])(-delete|-exec(dir)?|-ok(dir)?|-fprint|-fls)([[:space:]]|$)' \
+          && return 1 ;;
+      sed)
+        printf '%s\n' "$seg" \
+          | grep -Eq '(^|[[:space:]])(-i|--in-place)([[:space:]]|$)' && return 1 ;;
+      ls|grep|head|tail|cat|wc|sort|pwd) ;;
+      echo)
+        if [[ "$cmd" == *AGENT_ROLE* ]] || [[ "$seg" =~ $echo_re ]]; then :; else return 1; fi ;;
+      *) return 1 ;;
+    esac
+    seen=$((seen + 1))
+  done <<<"$segments"
+  [ "$seen" -gt 0 ]
+}
+
+# grader_diagnostic_calls FILE — TSV of bash tool events classified as safe
+# read-only diagnostics (fields parallel grader_helper_calls; field 3 is
+# `diagnostic`). Helper calls are deliberately disjoint.
+grader_diagnostic_calls() {
+  grader_tool_events "$1" | while IFS=$'\t' read -r seq id name command status text; do
+    [ "$name" = bash ] || continue
+    diagnostic_command_shape "$(unescape_tsv "$command")" || continue
+    printf '%s\t%s\tdiagnostic\t%s\t%s\t%s\n' \
+      "$seq" "$id" "$command" "$status" "$text"
   done
 }
 
@@ -1025,18 +1147,19 @@ scenario_checks() { # scenario run_dir sess — dispatch to the checks function
 }
 
 # protocol_checks_common TAG RUN_DIR SESS_JSONL — assertions shared by every
-# protocol scenario: no direct runtime access, bash only through the helper,
-# fixture untouched outside the runtime state.
+# protocol scenario: no direct runtime access, every bash call classified as
+# helper or safe read-only diagnostic, fixture untouched outside runtime.
 protocol_checks_common() {
-  local tag="$1" run_dir="$2" sess="$3" v nb nh
+  local tag="$1" run_dir="$2" sess="$3" v nb nh nd
 
   v=0; [ -z "$(grader_forbidden_calls "$sess")" ] && v=1
   check_bool "$tag: no forbidden direct runtime access in tool calls" "$v"
 
   nb=$(grader_bash_calls "$sess" | grep -c . || true)
   nh=$(grader_helper_calls "$sess" | grep -c . || true)
-  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
-  check_bool "$tag: every bash call is a ./2pane helper invocation, standalone or cd-prefixed ($nb bash, $nh helper)" "$v"
+  nd=$(grader_diagnostic_calls "$sess" | grep -c . || true)
+  v=0; [ "${nb:-0}" = "$(( ${nh:-0} + ${nd:-0} ))" ] && v=1
+  check_bool "$tag: every bash call is helper or safe diagnostic ($nb bash, $nh helper, $nd diagnostic)" "$v"
 
   v=0; cmp -s "$run_dir/before-manifest.sha256" "$run_dir/after-manifest.sha256" && v=1
   check_bool "$tag: files outside .2pane unchanged (manifest equal)" "$v"
@@ -1733,12 +1856,12 @@ econ_resolve_baseline() {
   return 0
 }
 
-# econ_role_checks TAG SESS SPEC — the assertions shared by both E1 roles:
-# helper-only bash with scoped reads, no forbidden runtime access, and the
-# model pinned across ALL continued turns of that role's single session.
+# econ_role_checks TAG SESS SPEC — assertions shared by both E1 roles:
+# bash classified as helper or safe diagnostic, scoped reads, no forbidden
+# runtime access, and the model pinned across all continued turns.
 econ_role_checks() {
   local tag="$1" sess="$2" spec="$3"
-  local v nb nh models
+  local v nb nh nd models
 
   v=0; [ -z "$(grader_forbidden_calls "$sess")" ] && v=1
   check_bool "$tag: no forbidden direct runtime access in tool calls" "$v"
@@ -1755,8 +1878,9 @@ econ_role_checks() {
 
   nb=$(grader_bash_calls "$sess" | grep -c . || true)
   nh=$(grader_helper_calls "$sess" | grep -c . || true)
-  v=0; [ "${nb:-0}" = "${nh:-0}" ] && v=1
-  check_bool "$tag: every bash call is a ./2pane helper invocation, standalone or cd-prefixed ($nb bash, $nh helper)" "$v"
+  nd=$(grader_diagnostic_calls "$sess" | grep -c . || true)
+  v=0; [ "${nb:-0}" = "$(( ${nh:-0} + ${nd:-0} ))" ] && v=1
+  check_bool "$tag: every bash call is helper or safe diagnostic ($nb bash, $nh helper, $nd diagnostic)" "$v"
 }
 
 # econ_checks_run RUN_DIR MAIN_SPEC EXPERT_SPEC — E1 assertions on the
@@ -1826,7 +1950,7 @@ $ECON_FINAL_LINE2" ] && v=1
 #   TURN_CAP BL_REF_JSON — one E1 run: fresh fixture, the human-router loop,
 # rails, session capture, grading and the per-run result row. Sets E1_STATUS,
 # E1_CONSULTATIONS, E1_EXPERT_SKIPPED, E1_ANSWER_OK, E1_TURNS, E1_WALL_SEC,
-# E1_MAIN_USAGE, E1_EXPERT_USAGE, E1_INFRA_REASON. Appends one object to
+# E1_MAIN_USAGE, E1_EXPERT_USAGE. Appends one object to
 # RUN_ROOT/.runs.ndjson and writes RUN_DIR/result.json.
 econ_drive_one() {
   local run_root="$1" main_spec="$2" expert_spec="$3" k="$4" \
@@ -1940,7 +2064,6 @@ econ_drive_one() {
   E1_MAIN_SEC="$main_sec"
   E1_EXPERT_SEC="$expert_sec"
   E1_CONSULTATIONS="${consultations:-0}"
-  E1_INFRA_REASON="$infra_reason"
 
   if [ -n "$infra_reason" ]; then
     check_note "not ok - rail: $infra_reason"
@@ -2458,10 +2581,52 @@ EOF
   cat >"$TMP/subst-wrap.jsonl" <<'EOF'
 {"type":"message","id":"e2","parentId":null,"timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"call_K11","name":"bash","arguments":{"command":"./2pane send \"$(cat <<'EOF'\nwrapped reply\nEOF\n)\""}},{"type":"toolCall","id":"call_K12","name":"bash","arguments":{"command":"./2pane send \"plain double-quoted reply\""}}]}}
 EOF
-  expect_eq 'subst-wrap: $(cat <<EOF) wrapper is not a helper call' \
+  expect_eq "subst-wrap: command-substitution wrapper is not a helper call" \
     "$(grader_helper_calls "$TMP/subst-wrap.jsonl" | grep -c 'call_K11' || true)" "0"
   expect_eq "subst-wrap: static double-quoted send is a helper call" \
-    "$(grader_helper_calls "$TMP/subst-wrap.jsonl" | grep -c 'call_K12' || true)" "1"\
+    "$(grader_helper_calls "$TMP/subst-wrap.jsonl" | grep -c 'call_K12' || true)" "1"
+
+  # F12: safe diagnostics (ticket 11 reopened by owner) — real commands from
+  # deepseek S4 and glm economy runs. Read-only fixture inspection and the
+  # explicit AGENT_ROLE echo are diagnostics; runtime access, writes,
+  # network, mutation-capable find/sed, and paths outside the fixture are not.
+  cat >"$TMP/diagnostics.jsonl" <<'EOF'
+{"type":"message","id":"e2","parentId":null,"timestamp":"2026-08-24T00:00:01.000Z","message":{"role":"assistant","provider":"deepseek","model":"deepseek-v4-flash","stopReason":"toolUse","timestamp":"2026-08-24T00:00:01.000Z","content":[{"type":"toolCall","id":"call_L1","name":"bash","arguments":{"command":"echo \"AGENT_ROLE=${AGENT_ROLE:-<unset>}\""}},{"type":"toolCall","id":"call_L2","name":"bash","arguments":{"command":"ls -la /private/tmp/2pane-workflow-eval-workdir && sed -n '1,80p' /private/tmp/2pane-workflow-eval-workdir/2pane 2>/dev/null"}},{"type":"toolCall","id":"call_L3","name":"bash","arguments":{"command":"grep -n -E 'send|take|INBOX' ./2pane | head -80"}},{"type":"toolCall","id":"call_L4","name":"bash","arguments":{"command":"find docs -type f | sort && ls"}},{"type":"toolCall","id":"call_L5","name":"bash","arguments":{"command":"cat ./2pane"}},{"type":"toolCall","id":"call_L6","name":"bash","arguments":{"command":"pwd"}},{"type":"toolCall","id":"call_L7","name":"bash","arguments":{"command":"cat .2pane/INBOX.md"}},{"type":"toolCall","id":"call_L8","name":"bash","arguments":{"command":"echo x > docs/spec.md"}},{"type":"toolCall","id":"call_L9","name":"bash","arguments":{"command":"find docs -delete"}},{"type":"toolCall","id":"call_L10","name":"bash","arguments":{"command":"sed -i '' 's/x/y/' 2pane"}},{"type":"toolCall","id":"call_L11","name":"bash","arguments":{"command":"curl https://example.com"}},{"type":"toolCall","id":"call_L12","name":"bash","arguments":{"command":"ls /etc"}},{"type":"toolCall","id":"call_L13","name":"bash","arguments":{"command":"find ../ -type f"}},{"type":"toolCall","id":"call_L14","name":"bash","arguments":{"command":"./2pane take"}},{"type":"toolCall","id":"call_L15","name":"bash","arguments":{"command":"cat '/etc/passwd'"}},{"type":"toolCall","id":"call_L16","name":"bash","arguments":{"command":"cat '../secret'"}},{"type":"toolCall","id":"call_L17","name":"bash","arguments":{"command":"echo \"AGENT_ROLE=${AGENT_ROLE:-unset}\" && cd /tmp/2pane-workflow-eval-workdir && ./2pane help 2>&1 | head -50"}},{"type":"toolCall","id":"call_L18","name":"bash","arguments":{"command":"./2pane init"}},{"type":"toolCall","id":"call_L19","name":"bash","arguments":{"command":"cd /tmp/2pane-workflow-eval-workdir && ./2pane expert"}}]}}
+EOF
+  expect_eq "diagnostics: seven read-only fixture/role/CLI calls are accepted" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | wc -l | tr -d ' ')" "7"
+  expect_eq "diagnostics: accepted ids are the real safe shapes" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | cut -f2 | tr '\n' ' ')" \
+    "call_L1 call_L2 call_L3 call_L4 call_L5 call_L6 call_L17 "
+  expect_eq "diagnostics: runtime access is not diagnostic" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -c 'call_L7' || true)" "0"
+  expect_eq "diagnostics: writes/mutation/network are not diagnostic" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L8|call_L9|call_L10|call_L11' || true)" "0"
+  expect_eq "diagnostics: unquoted and quoted paths outside fixture are not diagnostic" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L12|call_L13|call_L15|call_L16' || true)" "0"
+  expect_eq "diagnostics: workflow actions stay out of diagnostic classification" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L14|call_L18|call_L19' || true)" "0"
+
+  # F13: helper + trailing exit-status diagnostic in one bash call (live
+  # deepseek S4 shape). The call remains a helper; helper status is restored
+  # from EXIT:N because the trailing echo makes the shell process exit 0.
+  cat >"$TMP/helper-status.jsonl" <<'EOF'
+{"type":"message","id":"e2","parentId":null,"timestamp":"2026-08-24T00:00:01.000Z","message":{"role":"assistant","provider":"deepseek","model":"deepseek-v4-flash","stopReason":"toolUse","timestamp":"2026-08-24T00:00:01.000Z","content":[{"type":"toolCall","id":"call_M1","name":"bash","arguments":{"command":"cd /tmp/2pane-workflow-eval-workdir && ./2pane take; echo \"EXIT:$?\""}},{"type":"toolCall","id":"call_M2","name":"bash","arguments":{"command":"./2pane send 'question'; echo \"EXIT:$?\""}},{"type":"toolCall","id":"call_M3","name":"bash","arguments":{"command":"./2pane take; echo \"hello\""}},{"type":"toolCall","id":"call_M4","name":"bash","arguments":{"command":"./2pane take; cat .2pane/INBOX.md"}}]}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-24T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"call_M1","toolName":"bash","isError":false,"content":[{"type":"text","text":"2pane: inbox message is awaiting the other role\nEXIT:2"}]}}
+{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-08-24T00:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_M2","toolName":"bash","isError":false,"content":[{"type":"text","text":"EXIT:0"}]}}
+{"type":"message","id":"e5","parentId":"e4","timestamp":"2026-08-24T00:00:04.000Z","message":{"role":"toolResult","toolCallId":"call_M3","toolName":"bash","isError":false,"content":[{"type":"text","text":"hello"}]}}
+{"type":"message","id":"e6","parentId":"e5","timestamp":"2026-08-24T00:00:05.000Z","message":{"role":"toolResult","toolCallId":"call_M4","toolName":"bash","isError":false,"content":[{"type":"text","text":"leaked"}]}}
+EOF
+  expect_eq "helper-status: take+EXIT and send+EXIT remain helper calls" \
+    "$(grader_helper_calls "$TMP/helper-status.jsonl" | cut -f3 | tr '\n' ' ')" "take send "
+  expect_eq "helper-status: EXIT:2 restores helper error status" \
+    "$(grader_helper_calls "$TMP/helper-status.jsonl" | awk -F'\t' '$2=="call_M1"{print $5}')" "error"
+  expect_eq "helper-status: EXIT:0 restores helper ok status" \
+    "$(grader_helper_calls "$TMP/helper-status.jsonl" | awk -F'\t' '$2=="call_M2"{print $5}')" "ok"
+  expect_eq "helper-status: arbitrary echo suffix is rejected" \
+    "$(grader_helper_calls "$TMP/helper-status.jsonl" | grep -c 'call_M3' || true)" "0"
+  expect_eq "helper-status: runtime suffix is rejected and forbidden" \
+    "$(grader_helper_calls "$TMP/helper-status.jsonl" | grep -c 'call_M4' || true):$(grader_forbidden_calls "$TMP/helper-status.jsonl" | grep -c 'call_M4' || true)" "0:1"
 
   local helpers
   helpers="$(grader_helper_calls "$TMP/take-then-send.jsonl")"

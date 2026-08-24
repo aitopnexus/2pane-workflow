@@ -4,8 +4,10 @@ A self-contained runner/grader that answers two questions about the two-pane
 workflow:
 
 1. **Protocol** — does a cheap Main-Model follow the generated `SKILL.md`:
-   only `./2pane send` / `./2pane take`, no direct access to the runtime
-   files, busy inbox preserved, own-role messages treated correctly?
+   route inbox actions only through `./2pane send` / `./2pane take`, never
+   access runtime files directly, preserve a busy inbox and treat own-role
+   messages correctly? Safe read-only diagnostics of fixture files/role are
+   allowed; they are not inbox actions.
 2. **Economy** — does routing the hard part through the two-pane Expert use
    fewer expensive-Expert tokens than running that Expert on the whole task
    alone?
@@ -74,6 +76,14 @@ take reports the message awaits the other role and nothing is consumed).
 `summary.json` / `summary.txt` group results by the **actual** Main-model
 observed in the sessions, with passed/N, protocol and infra failures per
 scenario.
+
+Bash calls are classified, not blanket-rejected: helper calls and safe
+read-only diagnostics (`ls/find/grep/sed/head/tail/cat/wc/sort/pwd`,
+fixture-only `cd`, `./2pane help|-h|--help`, narrow `echo AGENT_ROLE`) are
+accepted. A helper may append only `; echo "EXIT:$?"`; its semantic status is
+restored from the marker. Runtime paths, writes, network, mutation flags,
+command substitution and paths outside the fixture remain protocol
+violations; manifest/state checks are independent.
 
 ### `baseline` — the one expensive Expert-only run, cached
 
