@@ -314,6 +314,50 @@ split_unquoted_amp() {
   printf '%s\0' "$seg"
 }
 
+# fixture_scoped_path PATH — exit 0 iff PATH is a literal path contained by
+# the eval fixture. Relative paths are interpreted from the fixed eval cwd;
+# shell expansions and parent traversal are rejected.
+fixture_scoped_path() {
+  local p="$1" wdphys=""
+  case "$p" in
+    \"*\") p="${p#\"}"; p="${p%\"}" ;;
+    \'*\') p="${p#\'}"; p="${p%\'}" ;;
+  esac
+  case "$p" in
+    ''|*'$'*|*'`'*|*'~'*|*'*'*|*'?'*) return 1 ;;
+    ../*|*/../*|*/..|..) return 1 ;;
+  esac
+  case "$p" in
+    /*)
+      case "$p" in "$EVAL_WORKDIR"|"$EVAL_WORKDIR"/*) return 0 ;; esac
+      [ -d "$EVAL_WORKDIR" ] && wdphys="$(cd "$EVAL_WORKDIR" && pwd -P)"
+      [ -n "$wdphys" ] || return 1
+      case "$p" in "$wdphys"|"$wdphys"/*) return 0 ;; esac
+      return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# send_input_path LAST_SEG — print the operand of a single-file stdin
+# redirection on `./2pane send`, or fail for every other shape.
+send_input_path() {
+  local seg="$1" tail r
+  seg="${seg#"${seg%%[![:space:]]*}"}"
+  tail="${seg#./2pane}"
+  [ "$tail" != "$seg" ] || return 1
+  tail="${tail#"${tail%%[![:space:]]*}"}"
+  r="${tail#send}"
+  [ "$r" != "$tail" ] || return 1
+  tail="${r#"${r%%[![:space:]]*}"}"
+  case "$tail" in "<"*) ;; *) return 1 ;; esac
+  r="${tail#<}"
+  local redir_re='^[[:space:]]*[^[:space:];&|<>]+[[:space:]]*$'
+  [[ "$r" =~ $redir_re ]] || return 1
+  r="${r#"${r%%[![:space:]]*}"}"
+  r="${r%"${r##*[![:space:]]}"}"
+  printf '%s\n' "$r"
+}
+
 # send_tail_shape LAST_SEG — exit 0 iff LAST_SEG is `./2pane send` feeding
 # its message on standard input: a here-document (operator alone on the
 # first line, terminator word up to 8 alphanumerics, body closed by a
@@ -349,10 +393,8 @@ send_tail_shape() {
       [ "$stripped" = "$term" ] || return 1
       return 0 ;;
     "<"*)
-      r="${tail#<}"
-      local redir_re='^[[:space:]]*[^[:space:];&|<>]+[[:space:]]*$'
-      [[ "$r" =~ $redir_re ]] || return 1
-      return 0 ;;
+      r="$(send_input_path "$seg")" || return 1
+      fixture_scoped_path "$r" ;;
     *) return 1 ;;
   esac
 }
@@ -362,7 +404,7 @@ send_tail_shape() {
 # `./2pane send|take ...`, optionally preceded only by inert `cd DIR`
 # segments. No trailing command is accepted here.
 helper_core_shape_sub() {
-  local cmd="$1" seg sub i
+  local cmd="$1" seg sub i input_path="" cd_path
   local -a segs=() toks
   while IFS= read -r -d '' seg; do segs+=("$seg"); done < <(split_unquoted_amp "$cmd")
   local n=${#segs[@]}
@@ -370,6 +412,7 @@ helper_core_shape_sub() {
   sub="$(helper_subcommand "${segs[n-1]}")" || return 1
   if [ "$sub" = send ] && ! command_is_standalone "${segs[n-1]}"; then
     send_tail_shape "${segs[n-1]}" || return 1
+    input_path="$(send_input_path "${segs[n-1]}")" || true
   else
     command_is_standalone "${segs[n-1]}" || return 1
   fi
@@ -377,6 +420,10 @@ helper_core_shape_sub() {
     read -r -a toks <<<"${segs[i]}"
     [ "${toks[0]-}" = cd ] || return 1
     command_is_standalone "${segs[i]}" || return 1
+    if [ -n "$input_path" ]; then
+      cd_path="${toks[1]-}"
+      fixture_scoped_path "$cd_path" || return 1
+    fi
   done
   printf '%s\n' "$sub"
 }
@@ -438,13 +485,15 @@ grader_helper_calls() {
 # pragmatic classifier, not a shell security boundary; forbidden-path and
 # manifest checks remain independent gates.
 diagnostic_command_shape() {
-  local cmd="$1" skeleton scan normalized wdphys segments seg first seen=0 tmp
+  local cmd="$1" skeleton scan normalized wdphys fixture_root collision_re segments seg first seen=0 tmp
   local -a toks
 
   helper_shape_sub "$cmd" >/dev/null 2>&1 && return 1
   printf '%s\n' "$cmd" | grep -Eq '\.2pane|INBOX\.md|consuming\.md' && return 1
   local quoted_outside_re=$'[\x27\x22](/|\\.\\./)'
   printf '%s\n' "$cmd" | grep -Eq "$quoted_outside_re" && return 1
+  local traversal_re=$'(^|[/[:space:];|\x27\x22])\\.\\.(/|[[:space:];|\x27\x22]|$)'
+  printf '%s\n' "$cmd" | grep -Eq "$traversal_re" && return 1
   local subst_marker=$'\x24\x28' backtick_marker=$'\x60'
   case "$cmd" in *"$subst_marker"*|*"$backtick_marker"*) return 1 ;; esac
 
@@ -458,12 +507,20 @@ diagnostic_command_shape() {
   # Normalize both literal and physical spellings of the fixed fixture path.
   wdphys="$(cd "$(dirname "$EVAL_WORKDIR")" 2>/dev/null \
     && printf '%s/%s' "$(pwd -P)" "$(basename "$EVAL_WORKDIR")" || true)"
+  # A fixture spelling is safe only as a complete path component. Without
+  # this boundary check, `/tmp/...-workdir-escape` is normalized as though it
+  # were inside `/tmp/...-workdir`.
+  for fixture_root in "$wdphys" "$EVAL_WORKDIR"; do
+    [ -n "$fixture_root" ] || continue
+    collision_re="${fixture_root}"$'[^/[:space:];|\x27\x22]'
+    [[ "$scan" =~ $collision_re ]] && return 1
+  done
   normalized="$scan"
   [ -n "$wdphys" ] && normalized="${normalized//$wdphys/.}"
   normalized="${normalized//$EVAL_WORKDIR/.}"
   normalized="${normalized//\/dev\/null/}"
   printf '%s\n' "$normalized" \
-    | grep -Eq '(^|[[:space:];|])\.\.(/|[[:space:];|]|$)' && return 1
+    | grep -Eq '(^|[/[:space:];|])\.\.(/|[[:space:];|]|$)' && return 1
   printf '%s\n' "$normalized" \
     | grep -Eq '(^|[[:space:];|])/[^[:space:];|]+' && return 1
 
@@ -1972,7 +2029,7 @@ econ_drive_one() {
   local start_sec end_sec
   start_sec="$(date +%s)"
   local actor="main" turn=0 main_turns=0 consultations=0 infra_reason=""
-  local main_sec=0 expert_sec=0 turn_start
+  local main_sec=0 expert_sec=0 turn_start turn_timeout deadline_limited
   local main_jsonl="" expert_jsonl="" prompt tdir
 
   # The human-router loop: rails before every turn, then route on the live
@@ -1989,6 +2046,17 @@ econ_drive_one() {
     fi
     turn=$((turn + 1))
     turn_start="$(date +%s)"
+    elapsed=$((turn_start - start_sec))
+    turn_timeout="$per_timeout"
+    deadline_limited=0
+    if [ "$((run_timeout - elapsed))" -lt "$turn_timeout" ]; then
+      turn_timeout="$((run_timeout - elapsed))"
+      deadline_limited=1
+    fi
+    if [ "$turn_timeout" -le 0 ]; then
+      infra_reason="wall-clock run timeout ${run_timeout}s reached"
+      break
+    fi
     tdir="$run_dir/turns/$(printf 'T%02d' "$turn")-$actor"
     mkdir -p "$tdir"
 
@@ -2006,14 +2074,18 @@ econ_drive_one() {
       [ "$main_turns" -gt 1 ] && resumed=true
       parse_model_spec "$main_spec"
       run_pi_once "$tdir" "$main_sessions" "$main_spec" "$prompt" \
-        "$per_timeout" "$main_jsonl" main
+        "$turn_timeout" "$main_jsonl" main
       write_usage_json "$tdir"
       write_run_metadata "$tdir" economy e1 "$k" main "$main_spec" \
         "$(jq -cn --argjson turn "$turn" --arg actor main --argjson resumed "$resumed" \
           '{turn:$turn, actor:$actor, resumed:$resumed}')"
       main_jsonl="$(find "$main_sessions" -maxdepth 1 -name '*.jsonl' -type f | LC_ALL=C sort | head -n1)"
       if [ "$RUN_INFRA" = 1 ]; then
-        infra_reason="infrastructure failure in main turn $turn"
+        if [ "$RUN_TIMED_OUT" = 1 ] && [ "$deadline_limited" = 1 ]; then
+          infra_reason="wall-clock run timeout ${run_timeout}s reached"
+        else
+          infra_reason="infrastructure failure in main turn $turn"
+        fi
         break
       fi
       consultations=$(grader_helper_calls "$main_jsonl" send \
@@ -2025,14 +2097,18 @@ econ_drive_one() {
       [ -n "$expert_jsonl" ] && resumed=true
       parse_model_spec "$expert_spec"
       run_pi_once "$tdir" "$expert_sessions" "$expert_spec" "$prompt" \
-        "$per_timeout" "$expert_jsonl" expert
+        "$turn_timeout" "$expert_jsonl" expert
       write_usage_json "$tdir"
       write_run_metadata "$tdir" economy e1 "$k" expert "$expert_spec" \
         "$(jq -cn --argjson turn "$turn" --arg actor expert --argjson resumed "$resumed" \
           '{turn:$turn, actor:$actor, resumed:$resumed}')"
       expert_jsonl="$(find "$expert_sessions" -maxdepth 1 -name '*.jsonl' -type f | LC_ALL=C sort | head -n1)"
       if [ "$RUN_INFRA" = 1 ]; then
-        infra_reason="infrastructure failure in expert turn $turn"
+        if [ "$RUN_TIMED_OUT" = 1 ] && [ "$deadline_limited" = 1 ]; then
+          infra_reason="wall-clock run timeout ${run_timeout}s reached"
+        else
+          infra_reason="infrastructure failure in expert turn $turn"
+        fi
         break
       fi
     fi
@@ -2556,18 +2632,23 @@ EOF
 {"type":"session","version":3,"timestamp":"2026-08-22T00:00:00.000Z","cwd":"/tmp/2pane-workflow-eval-workdir"}
 {"type":"message","id":"e1","parentId":null,"timestamp":"2026-08-22T00:00:00.200Z","message":{"role":"user","timestamp":"2026-08-22T00:00:00.200Z","content":[{"type":"text","text":"Consult."}]}}
 {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-08-22T00:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:01.000Z","content":[{"type":"toolCall","id":"call_K1","name":"bash","arguments":{"command":"./2pane send <<'EOF'\nVerdict: no lock. Re .2pane/INBOX.md safety: atomic rename suffices.\nEOF"}},{"type":"toolCall","id":"call_K2","name":"bash","arguments":{"command":"cd /tmp/wd && ./2pane  send <<-'EOT'\nlong body with && noise mentioning INBOX.md too\n\tEOT"}},{"type":"toolCall","id":"call_K3","name":"bash","arguments":{"command":"./2pane take </tmp/seed.txt"}},{"type":"toolCall","id":"call_K4","name":"bash","arguments":{"command":"cat <<'EOF'\nplain heredoc data\nEOF"}},{"type":"toolCall","id":"call_K5","name":"bash","arguments":{"command":"./2pane send <<'EOF'\nbody\nEOF | tee /tmp/log"}},{"type":"toolCall","id":"call_K6","name":"bash","arguments":{"command":"./2pane send 'question mentioning .2pane/INBOX.md and consuming.md in text'"}},{"type":"toolCall","id":"call_K7","name":"bash","arguments":{"command":"cat .2pane/INBOX.md"}},{"type":"toolCall","id":"call_K8","name":"bash","arguments":{"command":"cd /tmp/wd/.2pane && ./2pane take"}},{"type":"toolCall","id":"call_K9","name":"read","arguments":{"path":".2pane/consuming.md"}},{"type":"toolCall","id":"call_K10","name":"bash","arguments":{"command":"./2pane send < reply.txt"}}],"usage":{"input":100,"output":10,"totalTokens":110,"cost":{"total":0.011}}}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-22T00:00:02.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","stopReason":"toolUse","timestamp":"2026-08-22T00:00:02.000Z","content":[{"type":"toolCall","id":"call_K13","name":"bash","arguments":{"command":"./2pane send < /etc/passwd"}},{"type":"toolCall","id":"call_K14","name":"bash","arguments":{"command":"./2pane send < docs/../../../etc/passwd"}},{"type":"toolCall","id":"call_K15","name":"bash","arguments":{"command":"./2pane send < /tmp/2pane-workflow-eval-workdir-escape/file"}},{"type":"toolCall","id":"call_K16","name":"bash","arguments":{"command":"./2pane send < /tmp/2pane-workflow-eval-workdir/reply.txt"}},{"type":"toolCall","id":"call_K17","name":"bash","arguments":{"command":"cd /tmp && ./2pane send < reply.txt"}},{"type":"toolCall","id":"call_K18","name":"bash","arguments":{"command":"./2pane send < /private/tmp/2pane-workflow-eval-workdir/reply.txt"}}]}}
 EOF
 
   expect_eq "stdin-send: heredoc send counts as a helper send (incl cd-prefix, <<-, && in body)" \
-    "$(grader_helper_calls "$TMP/heredoc.jsonl" send | wc -l | tr -d ' ')" "4"
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" send | wc -l | tr -d ' ')" "6"
   expect_eq "stdin-send: subcommands in order (quoted-mention send included)" \
-    "$(grader_helper_calls "$TMP/heredoc.jsonl" | cut -f3 | tr '\n' ' ')" "send send send take send "
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | cut -f3 | tr '\n' ' ')" "send send send take send send send "
   expect_eq "stdin-send: take with input redirection is not a helper call" \
     "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -c 'call_K3' || true)" "0"
   expect_eq "stdin-send: non-helper heredoc command is not a helper call" \
     "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -c 'call_K4' || true)" "0"
   expect_eq "stdin-send: piped-after-terminator send is not a helper call" \
     "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -c 'call_K5' || true)" "0"
+  expect_eq "stdin-send: outside, traversal, prefix-collision, and outside-cd inputs are rejected" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -Ec 'call_K13|call_K14|call_K15|call_K17' || true)" "0"
+  expect_eq "stdin-send: literal and physical fixture-absolute inputs are accepted" \
+    "$(grader_helper_calls "$TMP/heredoc.jsonl" | grep -Ec 'call_K16|call_K18' || true)" "2"
   expect_eq "mention: quoted payload mentions are not forbidden (send args, heredoc body, <file)" \
     "$(grader_forbidden_calls "$TMP/heredoc.jsonl" | grep -Ec 'call_K1|call_K2|call_K6|call_K10' || true)" "0"
   expect_eq "mention: unquoted runtime paths still forbidden (cat, cd-into)" \
@@ -2592,6 +2673,7 @@ EOF
   # network, mutation-capable find/sed, and paths outside the fixture are not.
   cat >"$TMP/diagnostics.jsonl" <<'EOF'
 {"type":"message","id":"e2","parentId":null,"timestamp":"2026-08-24T00:00:01.000Z","message":{"role":"assistant","provider":"deepseek","model":"deepseek-v4-flash","stopReason":"toolUse","timestamp":"2026-08-24T00:00:01.000Z","content":[{"type":"toolCall","id":"call_L1","name":"bash","arguments":{"command":"echo \"AGENT_ROLE=${AGENT_ROLE:-<unset>}\""}},{"type":"toolCall","id":"call_L2","name":"bash","arguments":{"command":"ls -la /private/tmp/2pane-workflow-eval-workdir && sed -n '1,80p' /private/tmp/2pane-workflow-eval-workdir/2pane 2>/dev/null"}},{"type":"toolCall","id":"call_L3","name":"bash","arguments":{"command":"grep -n -E 'send|take|INBOX' ./2pane | head -80"}},{"type":"toolCall","id":"call_L4","name":"bash","arguments":{"command":"find docs -type f | sort && ls"}},{"type":"toolCall","id":"call_L5","name":"bash","arguments":{"command":"cat ./2pane"}},{"type":"toolCall","id":"call_L6","name":"bash","arguments":{"command":"pwd"}},{"type":"toolCall","id":"call_L7","name":"bash","arguments":{"command":"cat .2pane/INBOX.md"}},{"type":"toolCall","id":"call_L8","name":"bash","arguments":{"command":"echo x > docs/spec.md"}},{"type":"toolCall","id":"call_L9","name":"bash","arguments":{"command":"find docs -delete"}},{"type":"toolCall","id":"call_L10","name":"bash","arguments":{"command":"sed -i '' 's/x/y/' 2pane"}},{"type":"toolCall","id":"call_L11","name":"bash","arguments":{"command":"curl https://example.com"}},{"type":"toolCall","id":"call_L12","name":"bash","arguments":{"command":"ls /etc"}},{"type":"toolCall","id":"call_L13","name":"bash","arguments":{"command":"find ../ -type f"}},{"type":"toolCall","id":"call_L14","name":"bash","arguments":{"command":"./2pane take"}},{"type":"toolCall","id":"call_L15","name":"bash","arguments":{"command":"cat '/etc/passwd'"}},{"type":"toolCall","id":"call_L16","name":"bash","arguments":{"command":"cat '../secret'"}},{"type":"toolCall","id":"call_L17","name":"bash","arguments":{"command":"echo \"AGENT_ROLE=${AGENT_ROLE:-unset}\" && cd /tmp/2pane-workflow-eval-workdir && ./2pane help 2>&1 | head -50"}},{"type":"toolCall","id":"call_L18","name":"bash","arguments":{"command":"./2pane init"}},{"type":"toolCall","id":"call_L19","name":"bash","arguments":{"command":"cd /tmp/2pane-workflow-eval-workdir && ./2pane expert"}}]}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-08-24T00:00:02.000Z","message":{"role":"assistant","provider":"deepseek","model":"deepseek-v4-flash","stopReason":"toolUse","timestamp":"2026-08-24T00:00:02.000Z","content":[{"type":"toolCall","id":"call_L20","name":"bash","arguments":{"command":"cat docs/../../../etc/passwd"}},{"type":"toolCall","id":"call_L21","name":"bash","arguments":{"command":"cat /tmp/2pane-workflow-eval-workdir-escape/file"}},{"type":"toolCall","id":"call_L22","name":"bash","arguments":{"command":"cat 'docs/../../../etc/passwd'"}}]}}
 EOF
   expect_eq "diagnostics: seven read-only fixture/role/CLI calls are accepted" \
     "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | wc -l | tr -d ' ')" "7"
@@ -2604,6 +2686,8 @@ EOF
     "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L8|call_L9|call_L10|call_L11' || true)" "0"
   expect_eq "diagnostics: unquoted and quoted paths outside fixture are not diagnostic" \
     "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L12|call_L13|call_L15|call_L16' || true)" "0"
+  expect_eq "diagnostics: nested traversal and fixture-prefix collisions are not diagnostic" \
+    "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L20|call_L21|call_L22' || true)" "0"
   expect_eq "diagnostics: workflow actions stay out of diagnostic classification" \
     "$(grader_diagnostic_calls "$TMP/diagnostics.jsonl" | grep -Ec 'call_L14|call_L18|call_L19' || true)" "0"
 
@@ -3320,6 +3404,7 @@ dir="$(dirname "$0")"
 mode="$(cat "$dir/econmode" 2>/dev/null || printf multi)"
 [ "$mode" = count ] && { printf 'called\n' >>"$dir/econcalls"; exit 0; }
 [ "$mode" = crash ] && exit 3
+[ "$mode" = hung ] && sleep 30
 sessdir=""; sessfile=""; model=""; prompt=""; prev=""
 for a in "$@"; do
   case "$prev" in
@@ -3547,14 +3632,18 @@ STUB
     "$(jq -e '.economyVerdict==null and .overall=="infra-fail"' "$run_root/summary.json" >/dev/null; echo $?)"
   rm -rf "$run_root"
 
-  # H: wall-clock rail — a slow endless loop stops as infra-fail.
-  printf 'endless\n' >"$TMP/econmode"
+  # H: wall-clock rail — an in-progress hung turn is limited to the
+  # remaining whole-run time, even when the per-call timeout is longer.
+  printf 'hung\n' >"$TMP/econmode"
   rm -f "$TMP/count"
   run_econ "$econ_store" "$TMP/pi-econ" --run-timeout 3 --turn-cap 100
   check "econ/run-timeout: wall clock triggers infra-fail (rc=$rc)" "$(if [  "$rc" -eq 3  ]; then echo 0; else echo 1; fi)"
   check "econ/run-timeout: rail recorded distinctly" \
     "$(grep -q '^not ok - rail: wall-clock run timeout 3s reached$' \
        "$run_root/e1-r1/checks.txt" 2>/dev/null; echo $?)"
+  check "econ/run-timeout: in-progress turn uses the remaining run time" \
+    "$(jq -e '.timeoutSec <= 3 and .timedOut == 1' \
+       "$run_root/e1-r1/turns/T01-main/metadata.json" >/dev/null; echo $?)"
   rm -rf "$run_root"
 
   # I: baseline pinning — exact id reused; bogus id is baseline-missing; a
