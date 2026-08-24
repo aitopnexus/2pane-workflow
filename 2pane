@@ -48,18 +48,16 @@ skill_content() {
   cat <<'EOF'
 ---
 name: two-pane-workflow
-description: 2pane inbox routing between Main and Expert. Use for explicit send/receive requests or AGENT_ROLE configuration.
+description: 2pane inbox routing between Main and Expert. Use for send/receive requests or AGENT_ROLE configuration.
 ---
 
 <!-- Managed by ./2pane init. -->
 
 # Two-pane workflow
 
-The human triggers and serializes each inbox action. `AGENT_ROLE=expert` selects Expert; unset selects Main.
+The human serializes inbox actions. `AGENT_ROLE=expert` selects Expert; otherwise Main.
 
-After any send, report its result in one line and yield until the human requests the next inbox action.
-
-Never inspect `.2pane/` directly; trust the helper's output and exit status.
+Start each requested action directly with one standalone `./2pane send ...` or `./2pane take`. Its result is final; successful send may print nothing. Report once and yield. Never retry, append probes, or inspect `.2pane/`, `INBOX.md`, or `consuming.md`.
 
 ## Send
 
