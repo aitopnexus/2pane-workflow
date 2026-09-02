@@ -25,7 +25,7 @@ Usage: 2pane <command> [options]
 Commands:
   init                       Initialize the workflow in this repository
   expert [codex-options...]  Start the Expert session
-  dev                        Create the 4-pane herdr dev workspace (pi, shell, codex, fast pi)
+  dev                        Create the 4-pane herdr dev workspace, reusing a live one
   send [message]             Send a message to the other role
   take                       Read and consume the waiting message
 
@@ -224,6 +224,20 @@ herdr_pane_ids() {
   herdr pane list 2>/dev/null | grep -o '"pane_id":"[^"]*"' | sed 's/.*:"//; s/"$//' | sort || true
 }
 
+existing_dev_workspace() {
+  # A live expert pane (label expert, codex running, cwd at this repository)
+  # identifies an existing dev environment for this repo, so `dev` can reuse
+  # it. Panes are split one per line; nested objects stay attached to their
+  # pane. awk instead of sed because BSD sed has no \n in replacements.
+  herdr pane list 2>/dev/null \
+    | awk '{ gsub(/\},\{/, "\n") } 1' \
+    | grep -F '"label":"expert"' \
+    | grep -F '"agent":"codex"' \
+    | grep -F "\"cwd\":\"$ROOT\"" \
+    | sed -n 's/.*"workspace_id":"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
 herdr_new_pane() { # herdr_new_pane <json-response> <pane-ids-before>
   pane="$(herdr_pane_id "$1")"
   if [ -z "$pane" ]; then
@@ -255,6 +269,13 @@ dev_environment() {
   init_state
   if ! command -v herdr >/dev/null 2>&1; then
     fail "dev requires the herdr CLI on PATH"
+  fi
+
+  existing="$(existing_dev_workspace)"
+  if [ -n "$existing" ]; then
+    herdr workspace focus "$existing" >/dev/null 2>&1 || true
+    printf 'Dev environment already exists in workspace %s; focusing it instead of creating another.\n' "$existing"
+    return 0
   fi
 
   pfast_flags="${TWOPANE_DEV_PFAST_FLAGS:-}"

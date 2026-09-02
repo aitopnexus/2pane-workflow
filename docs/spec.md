@@ -127,7 +127,7 @@ shell          1/3 height | pfast (fast pi) 1/3 height
 - The Expert pane is created with `--env AGENT_ROLE=expert`, so `./2pane send` and `./2pane take` inside that pane answer as expert. The `pfast` helper pane does not carry the Expert role.
 - Agents start through `herdr agent start`: `main` runs pi, `expert` runs codex with the same lean defaults as `./2pane expert` (`EXPERT_FULL=1` bypasses them), `pfast` runs pi with fast-model flags. `TWOPANE_DEV_PFAST_FLAGS` overrides those flags.
 - Workspace or split failures abort with exit code 2. A failed agent start only prints a warning; the pane is left at a shell prompt.
-- Running `dev` again creates another workspace. herdr agent names are unique among live agents, so in a second workspace the named starts may warn while the layout still completes.
+- `dev` reuses a live environment instead of stacking a second one: when `herdr pane list` shows a pane labeled `expert` with the codex agent running and this repository as its `cwd`, `dev` focuses that workspace, prints a notice, and exits 0 without creating anything. An expert pane in another directory, or one whose codex agent is gone, does not block creation; herdr agent names are unique among live agents, so leftover named agents from a dead run only warn.
 
 ## Role detection
 

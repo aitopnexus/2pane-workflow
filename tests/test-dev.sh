@@ -66,6 +66,12 @@ case "$1 $2" in
     [ "${FAKE_HERDR_FAIL_AGENT:-}" = 1 ] && exit 1
     ;;
   "pane list")
+    if [ -n "${FAKE_HERDR_EXISTING_CWD:-}" ]; then
+      agent='"agent":"codex",'
+      [ "${FAKE_HERDR_EXISTING_DEAD:-}" = 1 ] && agent=''
+      printf '%s\n' "{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{$agent\"agent_status\":\"working\",\"cwd\":\"$FAKE_HERDR_EXISTING_CWD\",\"label\":\"expert\",\"pane_id\":\"w0:p2\",\"workspace_id\":\"w0\"}]}}"
+      exit 0
+    fi
     n="$(cat "$FAKE_STATE/splits" 2>/dev/null || echo 0)"
     i=1
     out='{"id":"cli:pane:list","result":{"panes":['
@@ -170,6 +176,32 @@ PATH="$FAKE_PATH" "$LAUNCHER" dev extra > "$TMP/out" 2> "$TMP/err"
 status=$?
 assert_equals "extra arguments exit two" "2" "$status"
 assert_contains "extra arguments message" "dev accepts no arguments" "$TMP/err"
+
+# Test 9: a live dev environment for this repository is reused, not duplicated.
+reset_fakes
+PATH="$FAKE_PATH" FAKE_HERDR_EXISTING_CWD="$TMP" \
+  "$LAUNCHER" dev > "$TMP/out" 2> "$TMP/err"
+assert_equals "existing environment exits zero" "0" "$?"
+assert_not_contains "no second workspace is created" "workspace create" "$HERDR_CALLS"
+assert_not_contains "no panes are split" "pane split" "$HERDR_CALLS"
+assert_contains "the existing workspace is focused" "workspace focus w0" "$HERDR_CALLS"
+assert_contains "reuse is reported" "Dev environment already exists" "$TMP/out"
+
+# Test 10: an expert pane in another directory does not block creation.
+reset_fakes
+PATH="$FAKE_PATH" FAKE_HERDR_EXISTING_CWD="/elsewhere" \
+  "$LAUNCHER" dev > "$TMP/out" 2> "$TMP/err"
+assert_equals "foreign expert exits zero" "0" "$?"
+assert_contains "a fresh workspace is still created" "workspace create --cwd $TMP" "$HERDR_CALLS"
+assert_not_contains "the foreign workspace is not focused" "workspace focus" "$HERDR_CALLS"
+
+# Test 11: an expert pane whose codex agent is gone does not block creation.
+reset_fakes
+PATH="$FAKE_PATH" FAKE_HERDR_EXISTING_CWD="$TMP" FAKE_HERDR_EXISTING_DEAD=1 \
+  "$LAUNCHER" dev > "$TMP/out" 2> "$TMP/err"
+assert_equals "dead expert rerun exits zero" "0" "$?"
+assert_contains "a fresh workspace is created when codex is gone" \
+  "workspace create --cwd $TMP" "$HERDR_CALLS"
 
 echo "---"
 echo "pass=$pass fail=$fail"
