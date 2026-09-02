@@ -66,6 +66,7 @@ case "$1 $2" in
     [ "${FAKE_HERDR_FAIL_AGENT:-}" = 1 ] && exit 1
     ;;
   "pane list")
+    [ "${FAKE_HERDR_FAIL_LIST:-}" = 1 ] && exit 1
     if [ -n "${FAKE_HERDR_EXISTING_CWD:-}" ]; then
       agent='"agent":"codex",'
       [ "${FAKE_HERDR_EXISTING_DEAD:-}" = 1 ] && agent=''
@@ -81,6 +82,9 @@ case "$1 $2" in
       i=$((i + 1))
     done
     printf '%s]}}\n' "$out"
+    ;;
+  "workspace focus")
+    [ "${FAKE_HERDR_FAIL_FOCUS:-}" = 1 ] && exit 1
     ;;
 esac
 exit 0
@@ -202,6 +206,28 @@ PATH="$FAKE_PATH" FAKE_HERDR_EXISTING_CWD="$TMP" FAKE_HERDR_EXISTING_DEAD=1 \
 assert_equals "dead expert rerun exits zero" "0" "$?"
 assert_contains "a fresh workspace is created when codex is gone" \
   "workspace create --cwd $TMP" "$HERDR_CALLS"
+
+# Test 12: failure to query existing panes aborts instead of risking a duplicate.
+reset_fakes
+PATH="$FAKE_PATH" FAKE_HERDR_FAIL_LIST=1 \
+  "$LAUNCHER" dev > "$TMP/out" 2> "$TMP/err"
+status=$?
+assert_equals "failed existing-workspace query exits two" "2" "$status"
+assert_contains "failed existing-workspace query reports an error" \
+  "could not query existing herdr workspaces" "$TMP/err"
+assert_not_contains "failed query does not create a workspace" \
+  "workspace create" "$HERDR_CALLS"
+
+# Test 13: failure to focus a reused workspace is reported as an error.
+reset_fakes
+PATH="$FAKE_PATH" FAKE_HERDR_EXISTING_CWD="$TMP" FAKE_HERDR_FAIL_FOCUS=1 \
+  "$LAUNCHER" dev > "$TMP/out" 2> "$TMP/err"
+status=$?
+assert_equals "failed existing-workspace focus exits two" "2" "$status"
+assert_contains "failed existing-workspace focus reports an error" \
+  "could not focus existing workspace w0" "$TMP/err"
+assert_not_contains "failed focus does not report successful reuse" \
+  "focusing it instead" "$TMP/out"
 
 echo "---"
 echo "pass=$pass fail=$fail"

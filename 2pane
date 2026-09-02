@@ -229,7 +229,8 @@ existing_dev_workspace() {
   # identifies an existing dev environment for this repo, so `dev` can reuse
   # it. Panes are split one per line; nested objects stay attached to their
   # pane. awk instead of sed because BSD sed has no \n in replacements.
-  herdr pane list 2>/dev/null \
+  panes="$(herdr pane list 2>/dev/null)" || return 1
+  printf '%s\n' "$panes" \
     | awk '{ gsub(/\},\{/, "\n") } 1' \
     | grep -F '"label":"expert"' \
     | grep -F '"agent":"codex"' \
@@ -271,9 +272,11 @@ dev_environment() {
     fail "dev requires the herdr CLI on PATH"
   fi
 
-  existing="$(existing_dev_workspace)"
+  existing="$(existing_dev_workspace)" ||
+    fail "could not query existing herdr workspaces"
   if [ -n "$existing" ]; then
-    herdr workspace focus "$existing" >/dev/null 2>&1 || true
+    herdr workspace focus "$existing" >/dev/null 2>&1 ||
+      fail "could not focus existing workspace $existing"
     printf 'Dev environment already exists in workspace %s; focusing it instead of creating another.\n' "$existing"
     return 0
   fi
