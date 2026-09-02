@@ -1,5 +1,6 @@
 .DS_Store
 .2pane/
 .zcode/
+.scratch/
 evals/results/
 evals/baselines/
