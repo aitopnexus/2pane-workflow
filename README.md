@@ -24,9 +24,12 @@ git commit -m "Add two-pane workflow"
 ## Use
 
 ```bash
+./2pane dev             # Open the 4-pane herdr dev workspace (pi, shell, codex, fast pi)
 ./2pane expert          # Start the Expert session
 ./2pane send 'message'  # Send to the other session
 ./2pane take            # Read and consume a message
 ```
+
+`./2pane dev` requires the [herdr](https://herdr.dev) CLI. It opens a workspace with Main (pi) and Expert (codex, lean defaults as in `./2pane expert`) panes plus two helper panes, and marks the expert column with `AGENT_ROLE=expert`.
 
 To update, repeat the install command.

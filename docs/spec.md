@@ -94,6 +94,7 @@ An executable at the repo root, with one command for each workflow operation:
 2pane
 2pane init
 2pane expert [codex-options...]
+2pane dev
 2pane send [message]
 2pane take
 ```
@@ -112,6 +113,21 @@ What it does:
 Launching Expert spends no model turn on an empty inbox. The human explicitly asks a pane to read when a message is waiting.
 
 Swapping which harness plays expert means editing the `exec` line.
+
+### The herdr dev environment
+
+Running `./2pane dev` requires the `herdr` CLI. It creates a new herdr workspace labeled `2pane: <repo>` with four panes:
+
+```
+main (pi)      2/3 height | expert (codex) 2/3 height
+shell          1/3 height | pfast (fast pi) 1/3 height
+```
+
+- The panes are created with `herdr pane split` and renamed `main`, `shell`, `expert`, and `pfast`.
+- The expert column is split with `--env AGENT_ROLE=expert`, so `./2pane send` and `./2pane take` inside it answer as expert.
+- Agents start through `herdr agent start`: `main` runs pi, `expert` runs codex with the same lean defaults as `./2pane expert` (`EXPERT_FULL=1` bypasses them), `pfast` runs pi with fast-model flags. `TWOPANE_DEV_PFAST_FLAGS` overrides those flags.
+- Workspace or split failures abort with exit code 2. A failed agent start only prints a warning; the pane is left at a shell prompt.
+- Running `dev` again creates another workspace. herdr agent names are unique among live agents, so in a second workspace the named starts may warn while the layout still completes.
 
 ## Role detection
 

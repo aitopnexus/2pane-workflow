@@ -811,7 +811,7 @@ fi
 
 # Variables reset before every pi process: role selection, session lookup
 # and the 2pane expert-launcher knobs. Recorded in metadata.
-EVAL_ENV_RESET=(AGENT_ROLE PI_CODING_AGENT_SESSION_DIR HERDR_ENV HERDR_PANE_ID EXPERT_FULL)
+EVAL_ENV_RESET=(AGENT_ROLE PI_CODING_AGENT_SESSION_DIR HERDR_ENV HERDR_PANE_ID EXPERT_FULL TWOPANE_DEV_PFAST_FLAGS)
 
 # Pinned pi flag set (order-stable; recorded verbatim in metadata).
 eval_pi_flags() { # main_spec sessions_dir

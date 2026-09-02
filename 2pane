@@ -25,6 +25,7 @@ Usage: 2pane <command> [options]
 Commands:
   init                       Initialize the workflow in this repository
   expert [codex-options...]  Start the Expert session
+  dev                        Create the 4-pane herdr dev workspace (pi, shell, codex, fast pi)
   send [message]             Send a message to the other role
   take                       Read and consume the waiting message
 
@@ -171,15 +172,7 @@ take_message() {
   rm -f "$CONSUMING"
 }
 
-launch_expert() {
-  init_state
-  export AGENT_ROLE=expert
-  if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-    if command -v herdr >/dev/null 2>&1; then
-      herdr pane rename "$HERDR_PANE_ID" expert || true
-    fi
-  fi
-
+codex_expert_defaults() {
   CODEX_EXPERT_DEFAULTS=()
   if [ "${EXPERT_FULL:-0}" != 1 ]; then
     CODEX_EXPERT_DEFAULTS=(
@@ -199,12 +192,110 @@ launch_expert() {
       -c 'tools.view_image=false'
     )
   fi
+}
+
+launch_expert() {
+  init_state
+  export AGENT_ROLE=expert
+  if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    if command -v herdr >/dev/null 2>&1; then
+      herdr pane rename "$HERDR_PANE_ID" expert || true
+    fi
+  fi
+
+  codex_expert_defaults
 
   if [ "${#CODEX_EXPERT_DEFAULTS[@]}" -gt 0 ]; then
     exec codex "${CODEX_EXPERT_DEFAULTS[@]}" "$@"
   else
     exec codex "$@"
   fi
+}
+
+warn() {
+  printf '2pane: %s\n' "$1" >&2
+}
+
+herdr_pane_id() { # herdr_pane_id <json-response>
+  printf '%s\n' "$1" | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p'
+}
+
+herdr_pane_ids() {
+  herdr pane list 2>/dev/null | grep -o '"pane_id":"[^"]*"' | sed 's/.*:"//; s/"$//' | sort || true
+}
+
+herdr_new_pane() { # herdr_new_pane <json-response> <pane-ids-before>
+  pane="$(herdr_pane_id "$1")"
+  if [ -z "$pane" ]; then
+    pane="$(comm -13 <(printf '%s\n' "$2") <(printf '%s\n' "$(herdr_pane_ids)") | head -n 1)"
+  fi
+  [ -n "$pane" ] || return 1
+  printf '%s\n' "$pane"
+}
+
+herdr_split_pane() { # herdr_split_pane <pane> <direction> <ratio> [extra herdr args...]
+  target="$1"
+  direction="$2"
+  ratio="$3"
+  shift 3
+  before="$(herdr_pane_ids)"
+  out="$(herdr pane split --pane "$target" --direction "$direction" --ratio "$ratio" "$@")" || return 1
+  herdr_new_pane "$out" "$before"
+}
+
+herdr_start_expert() { # herdr_start_expert <pane-id>
+  if [ "${#CODEX_EXPERT_DEFAULTS[@]}" -gt 0 ]; then
+    herdr agent start expert --kind codex --pane "$1" -- "${CODEX_EXPERT_DEFAULTS[@]}"
+  else
+    herdr agent start expert --kind codex --pane "$1"
+  fi
+}
+
+dev_environment() {
+  init_state
+  if ! command -v herdr >/dev/null 2>&1; then
+    fail "dev requires the herdr CLI on PATH"
+  fi
+
+  pfast_flags="${TWOPANE_DEV_PFAST_FLAGS:-}"
+  if [ -z "$pfast_flags" ]; then
+    pfast_flags='--no-context-files --no-skills --no-extensions --model zai/glm-5.3-flash --thinking low'
+  fi
+
+  before="$(herdr_pane_ids)"
+  out="$(herdr workspace create --cwd "$ROOT" --label "2pane: $(basename "$ROOT")" --focus)" ||
+    fail "herdr workspace create failed"
+  main_pane="$(herdr_new_pane "$out" "$before")" ||
+    fail "could not read the pane id from herdr workspace create output"
+
+  # The ratio is the share kept by the split pane, so 0.6667 leaves the top
+  # (agent) panes two thirds high and the bottom panes one third.
+  expert_pane="$(herdr_split_pane "$main_pane" right 0.5 --cwd "$ROOT" --env AGENT_ROLE=expert)" ||
+    fail "herdr pane split right failed"
+  shell_pane="$(herdr_split_pane "$main_pane" down 0.6667 --cwd "$ROOT")" ||
+    fail "herdr pane split down failed"
+  pfast_pane="$(herdr_split_pane "$expert_pane" down 0.6667 --cwd "$ROOT")" ||
+    fail "herdr pane split down failed"
+
+  herdr pane rename "$main_pane" main >/dev/null || true
+  herdr pane rename "$expert_pane" expert >/dev/null || true
+  herdr pane rename "$shell_pane" shell >/dev/null || true
+  herdr pane rename "$pfast_pane" pfast >/dev/null || true
+
+  if ! herdr agent start main --kind pi --pane "$main_pane" >/dev/null; then
+    warn "could not start pi in pane $main_pane; the pane is left at a shell prompt"
+  fi
+  codex_expert_defaults
+  if ! herdr_start_expert "$expert_pane" >/dev/null; then
+    warn "could not start codex in pane $expert_pane; the pane is left at a shell prompt"
+  fi
+  # $pfast_flags is a flag list, so it must word-split here.
+  if ! herdr agent start pfast --kind pi --pane "$pfast_pane" -- $pfast_flags >/dev/null; then
+    warn "could not start fast pi in pane $pfast_pane; the pane is left at a shell prompt"
+  fi
+
+  printf 'Dev environment ready:\n  main (pi):       %s\n  shell:           %s\n  expert (codex):  %s\n  pfast (fast pi): %s\n' \
+    "$main_pane" "$shell_pane" "$expert_pane" "$pfast_pane"
 }
 
 if [ "$#" -eq 0 ]; then
@@ -224,6 +315,10 @@ case "$1" in
   expert)
     shift
     launch_expert "$@"
+    ;;
+  dev)
+    [ "$#" -eq 1 ] || usage_error "dev accepts no arguments"
+    dev_environment
     ;;
   take)
     [ "$#" -eq 1 ] || usage_error "take accepts no arguments"
