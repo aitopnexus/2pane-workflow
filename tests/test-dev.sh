@@ -91,13 +91,13 @@ reset_fakes() {
 }
 
 # Test 1: the happy path creates the workspace, the 2/3-1/3 layout, and the
-# three agents, marking the expert column with AGENT_ROLE=expert.
+# three agents, marking only the Expert pane with AGENT_ROLE=expert.
 reset_fakes
 PATH="$FAKE_PATH" "$LAUNCHER" dev > "$TMP/out" 2> "$TMP/err"
 assert_equals "happy path exits zero" "0" "$?"
 assert_contains "workspace created in the repository" \
   "workspace create --cwd $TMP" "$HERDR_CALLS"
-assert_contains "right column split carries AGENT_ROLE=expert" \
+assert_contains "Expert pane carries AGENT_ROLE=expert" \
   "pane split --pane w1:p1 --direction right --ratio 0.5 --cwd $TMP --env AGENT_ROLE=expert" "$HERDR_CALLS"
 assert_contains "left column split keeps two thirds on top" \
   "pane split --pane w1:p1 --direction down --ratio 0.6667" "$HERDR_CALLS"

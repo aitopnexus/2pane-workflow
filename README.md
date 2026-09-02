@@ -30,6 +30,6 @@ git commit -m "Add two-pane workflow"
 ./2pane take            # Read and consume a message
 ```
 
-`./2pane dev` requires the [herdr](https://herdr.dev) CLI. It opens a workspace with Main (pi) and Expert (codex, lean defaults as in `./2pane expert`) panes plus two helper panes, and marks the expert column with `AGENT_ROLE=expert`.
+`./2pane dev` requires the [herdr](https://herdr.dev) CLI. It opens a workspace with Main (pi) and Expert (codex, lean defaults as in `./2pane expert`) panes plus two helper panes, and marks only the Expert pane with `AGENT_ROLE=expert`.
 
 To update, repeat the install command.
