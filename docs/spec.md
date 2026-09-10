@@ -145,13 +145,15 @@ Unset means main. Only the expert session needs configuration. The protocol skil
 On macOS, install the global CLI from the `aitopnexus/tap` Homebrew tap:
 
 ```bash
-brew install aitopnexus/tap/2pane
+brew tap aitopnexus/tap
+brew trust --formula aitopnexus/tap/two-pane
+brew install aitopnexus/tap/two-pane
 ```
 
 Then, from any target directory, run `2pane init`. A PATH-invoked executable
 stages its own version into `./2pane` before initialization. Repeating it
 updates the project copy and managed skill, while preserving the inbox. Update
-the global CLI with `brew upgrade aitopnexus/tap/2pane`; projects update only
+the global CLI with `brew upgrade aitopnexus/tap/two-pane`; projects update only
 when `2pane init` is run in them.
 
 As an alternative, run the public bootstrap installer. It downloads the

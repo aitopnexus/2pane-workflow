@@ -7,7 +7,9 @@ A minimal workflow for running Main and Expert agent sessions in one repository.
 On macOS, install the CLI once with Homebrew:
 
 ```bash
-brew install aitopnexus/tap/2pane
+brew tap aitopnexus/tap
+brew trust --formula aitopnexus/tap/two-pane
+brew install aitopnexus/tap/two-pane
 ```
 
 Then install or update the workflow in any existing project directory:
@@ -25,7 +27,7 @@ Update the global CLI and then selected projects with:
 
 ```bash
 brew update
-brew upgrade aitopnexus/tap/2pane
+brew upgrade aitopnexus/tap/two-pane
 cd /path/to/project && 2pane init
 ```
 
