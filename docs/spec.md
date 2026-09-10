@@ -145,8 +145,8 @@ Unset means main. Only the expert session needs configuration. The protocol skil
 On macOS, install the global CLI from the `aitopnexus/tap` Homebrew tap:
 
 ```bash
-brew tap aitopnexus/tap
 brew trust --formula aitopnexus/tap/two-pane
+brew tap aitopnexus/tap
 brew install aitopnexus/tap/two-pane
 ```
 

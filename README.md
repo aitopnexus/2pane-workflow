@@ -7,8 +7,8 @@ A minimal workflow for running Main and Expert agent sessions in one repository.
 On macOS, install the CLI once with Homebrew:
 
 ```bash
-brew tap aitopnexus/tap
 brew trust --formula aitopnexus/tap/two-pane
+brew tap aitopnexus/tap
 brew install aitopnexus/tap/two-pane
 ```
 
