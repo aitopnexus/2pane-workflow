@@ -2,13 +2,7 @@
 # Two-pane workflow state transitions and Expert launcher.
 set -eu
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="$ROOT/.2pane"
-INBOX="$STATE_DIR/INBOX.md"
-CONSUMING="$STATE_DIR/consuming.md"
-SKILL_DIR="$ROOT/.agents/skills/two-pane-workflow"
-SKILL="$SKILL_DIR/SKILL.md"
-GITIGNORE="$ROOT/.gitignore"
+invoked="${BASH_SOURCE[0]}"
 tmp=""
 
 cleanup() {
@@ -21,6 +15,10 @@ trap cleanup EXIT HUP INT TERM
 usage() {
   cat <<'EOF'
 Usage: 2pane <command> [options]
+
+Invoked through a symlink (e.g. a bin link to a checkout), 2pane targets the
+current directory, and `init` installs ./2pane there first. Otherwise it
+targets the repository holding the script.
 
 Commands:
   init                       Initialize the workflow in this repository
@@ -44,6 +42,39 @@ fail() {
   printf '2pane: %s\n' "$1" >&2
   exit 2
 }
+
+resolve_path() { # resolve_path <path>: print <path> with symlinks resolved
+  self="$1"
+  depth=0
+  while [ -L "$self" ]; do
+    depth=$((depth + 1))
+    [ "$depth" -le 40 ] || fail "could not resolve the 2pane script: symlink chain too deep"
+    link="$(readlink "$self")"
+    case "$link" in
+      /*) self="$link" ;;
+      *) self="$(dirname "$self")/$link" ;;
+    esac
+  done
+  printf '%s\n' "$self"
+}
+
+if [ -L "$invoked" ]; then
+  # Reached through a symlink, typically a bin link to a checkout: the current
+  # directory is the target, and init bootstraps ./2pane from the linked file.
+  ROOT="$(pwd)"
+  SELF="$(resolve_path "$invoked")"
+  LINK_INVOKED=1
+else
+  # Invoked by path (./2pane): the repository holding the script is the target.
+  ROOT="$(cd "$(dirname "$invoked")" && pwd)"
+  SELF="$invoked"
+fi
+STATE_DIR="$ROOT/.2pane"
+INBOX="$STATE_DIR/INBOX.md"
+CONSUMING="$STATE_DIR/consuming.md"
+SKILL_DIR="$ROOT/.agents/skills/two-pane-workflow"
+SKILL="$SKILL_DIR/SKILL.md"
+GITIGNORE="$ROOT/.gitignore"
 
 skill_content() {
   cat <<'EOF'
@@ -70,6 +101,26 @@ Run `./2pane send 'message'`.
 2. Complete the printed request.
 3. Send only its requested result fields directly with `./2pane send 'reply'`; `send` performs the slot check.
 EOF
+}
+
+self_install() {
+  # Symlink-invoked init: stage the linked script into the target, initialize
+  # via the staged copy, and promote it over ./2pane only on success, like
+  # install-2pane.sh, so a failed init preserves the working executable.
+  [ ! -e "$ROOT/2pane" ] || [ -f "$ROOT/2pane" ] ||
+    fail "$ROOT/2pane is not a regular file"
+  tmp="$(mktemp "$ROOT/.2pane.install.XXXXXX")"
+  install -m 0755 "$SELF" "$tmp"
+  if "$tmp" init; then
+    mv "$tmp" "$ROOT/2pane"
+    tmp=""
+    printf 'Installed 2pane in %s\n' "$ROOT"
+  else
+    status=$?
+    rm -f "$tmp"
+    tmp=""
+    exit "$status"
+  fi
 }
 
 init_workflow() {
@@ -334,7 +385,11 @@ case "$1" in
     ;;
   init)
     [ "$#" -eq 1 ] || usage_error "init accepts no arguments"
-    init_workflow
+    if [ "${LINK_INVOKED:-0}" -eq 1 ]; then
+      self_install
+    else
+      init_workflow
+    fi
     ;;
   expert)
     shift

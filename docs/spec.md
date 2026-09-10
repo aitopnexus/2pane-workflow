@@ -149,6 +149,8 @@ curl -fsSL https://raw.githubusercontent.com/aitopnexus/2pane-workflow/main/inst
 
 `init` installs the embedded protocol skill, adds `.2pane/` to `.gitignore`, and creates the empty inbox. It is idempotent and refuses to overwrite a skill it does not manage. No global configuration, AGENTS.md edits, or external dependencies are required.
 
+Alternatively, a symlink on PATH (e.g. `~/.local/bin/2pane` pointing at a local checkout's `2pane`) bootstraps without downloading: invoked through the link, `2pane` targets the current directory, and `init` stages `./2pane` there from the linked file before initializing, promoting it only on success.
+
 Runtime state is ignored in the target repository:
 
 ```text
