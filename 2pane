@@ -2,6 +2,7 @@
 # Two-pane workflow state transitions and Expert launcher.
 set -eu
 
+VERSION="0.1.0"
 invoked="${BASH_SOURCE[0]}"
 tmp=""
 
@@ -28,6 +29,7 @@ Commands:
   take                       Read and consume the waiting message
 
 Options:
+  -V, --version             Show the installed version
   -h, --help                 Show this help
 EOF
 }
@@ -379,6 +381,10 @@ if [ "$#" -eq 0 ]; then
 fi
 
 case "$1" in
+  -V|--version)
+    [ "$#" -eq 1 ] || usage_error "version accepts no additional arguments"
+    printf '%s\n' "$VERSION"
+    ;;
   -h|--help)
     [ "$#" -eq 1 ] || usage_error "help accepts no additional arguments"
     usage

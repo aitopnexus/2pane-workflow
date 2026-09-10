@@ -92,6 +92,7 @@ An executable at the repo root, with one command for each workflow operation:
 
 ```text
 2pane
+2pane --version
 2pane init
 2pane expert [codex-options...]
 2pane dev
@@ -141,7 +142,20 @@ Unset means main. Only the expert session needs configuration. The protocol skil
 
 ## Installation
 
-From the target repository, run the public bootstrap installer. It downloads the executable from the public GitHub repository over HTTPS and initializes it:
+On macOS, install the global CLI from the `aitopnexus/tap` Homebrew tap:
+
+```bash
+brew install aitopnexus/tap/2pane
+```
+
+Then, from any target directory, run `2pane init`. A PATH-invoked executable
+stages its own version into `./2pane` before initialization. Repeating it
+updates the project copy and managed skill, while preserving the inbox. Update
+the global CLI with `brew upgrade aitopnexus/tap/2pane`; projects update only
+when `2pane init` is run in them.
+
+As an alternative, run the public bootstrap installer. It downloads the
+executable from the public GitHub repository over HTTPS and initializes it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aitopnexus/2pane-workflow/main/install-2pane.sh | bash

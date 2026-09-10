@@ -45,6 +45,20 @@ else
   exit 1
 fi
 
+# The PATH command is the installed release; a project only receives it when
+# init runs. Existing transient state must survive that replacement.
+AGENT_ROLE=main run "$TARGET" send 'keep this message'
+printf '#!/usr/bin/env bash\nprintf "old executable\\n"\n' > "$TARGET/2pane"
+chmod +x "$TARGET/2pane"
+if run "$TARGET" init >/dev/null &&
+   [ "$("$TARGET/2pane" --version)" = "$(PATH="$BIN:$PATH" 2pane --version)" ] &&
+   [ "$(cat "$TARGET/.2pane/INBOX.md")" = "$(printf 'from: main\n\nkeep this message')" ]; then
+  printf 'ok - PATH init updates the project executable without changing the inbox\n'
+else
+  printf 'not ok - PATH init updates the project executable without changing the inbox\n'
+  exit 1
+fi
+
 printf '#!/usr/bin/env bash\nprintf "previous executable\\n"\n' > "$TARGET/2pane"
 chmod +x "$TARGET/2pane"
 printf 'custom skill\n' > "$TARGET/.agents/skills/two-pane-workflow/SKILL.md"

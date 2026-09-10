@@ -43,6 +43,12 @@ else
   check "--help shows help" 1
 fi
 
+if version="$("$TMP/2pane" --version 2>/dev/null)" && [ "$version" = '0.1.0' ]; then
+  check "--version shows the release version" 0
+else
+  check "--version shows the release version" 1
+fi
+
 if "$TMP/2pane" init >/dev/null &&
    [ -f "$TMP/.agents/skills/two-pane-workflow/SKILL.md" ] &&
    grep -Fqx '<!-- Managed by ./2pane init. -->' "$TMP/.agents/skills/two-pane-workflow/SKILL.md"; then
